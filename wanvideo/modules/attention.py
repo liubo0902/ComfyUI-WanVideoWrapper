@@ -14,19 +14,29 @@ except ModuleNotFoundError:
     FLASH_ATTN_2_AVAILABLE = False
 
 try:
-    from sageattention import sageattn
+    major, minor = torch.cuda.get_device_capability(0)
+    if f"{major}.{minor}" == "8.0":
+        from sageattention_sm80 import sageattn
+    elif f"{major}.{minor}" == "8.6":
+        from sageattention_sm86 import sageattn
+    elif f"{major}.{minor}" == "8.9":
+        from sageattention_sm89 import sageattn
+    elif major>=9:
+        from sageattention_sm90 import sageattn
+except:
+    try:
+        from sageattention import sageattn
+    except:
+        sageattn = None
+
+if sageattn is not None:
     @torch.compiler.disable()
     def sageattn_func(q, k, v, attn_mask=None, dropout_p=0, is_causal=False, tensor_layout="HND"):
         if q.dtype == torch.float32:
             return sageattn(q.to(torch.float16), k.to(torch.float16), v.to(torch.float16), attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal, tensor_layout=tensor_layout).to(torch.float32)
         else:
             return sageattn(q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal, tensor_layout=tensor_layout)
-except Exception as e:
-    print(f"Warning: Could not load sageattention: {str(e)}")
-    if isinstance(e, ModuleNotFoundError):
-        print("sageattention package is not installed")
-    elif isinstance(e, ImportError) and "DLL" in str(e):
-        print("sageattention DLL loading error")
+else:
     sageattn_func = None
 
 try:
