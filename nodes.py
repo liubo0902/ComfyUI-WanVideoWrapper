@@ -1298,8 +1298,8 @@ class WanVideoSampler:
             }
         }
 
-    RETURN_TYPES = ("LATENT", )
-    RETURN_NAMES = ("samples",)
+    RETURN_TYPES = ("LATENT", "LATENT",)
+    RETURN_NAMES = ("samples", "denoised_samples",)
     FUNCTION = "process"
     CATEGORY = "WanVideoWrapper"
 
@@ -1816,16 +1816,16 @@ class WanVideoSampler:
             block_swap_args = transformer_options.get("block_swap_args", None)
 
         if block_swap_args is not None:
-            transformer.use_non_blocking = block_swap_args.get("use_non_blocking", True)
+            transformer.use_non_blocking = block_swap_args.get("use_non_blocking", False)
             for name, param in transformer.named_parameters():
                 if "block" not in name:
                     param.data = param.data.to(device)
                 if "control_adapter" in name:
                     param.data = param.data.to(device)
                 elif block_swap_args["offload_txt_emb"] and "txt_emb" in name:
-                    param.data = param.data.to(offload_device, non_blocking=transformer.use_non_blocking)
+                    param.data = param.data.to(offload_device)
                 elif block_swap_args["offload_img_emb"] and "img_emb" in name:
-                    param.data = param.data.to(offload_device, non_blocking=transformer.use_non_blocking)
+                    param.data = param.data.to(offload_device)
 
             transformer.block_swap(
                 block_swap_args["blocks_to_swap"] - 1 ,
@@ -1873,6 +1873,7 @@ class WanVideoSampler:
         # FlowEdit setup
         if flowedit_args is not None:
             source_embeds = flowedit_args["source_embeds"]
+            source_embeds = dict_to_device(source_embeds, device)
             source_image_embeds = flowedit_args.get("source_image_embeds", image_embeds)
             source_image_cond = source_image_embeds.get("image_embeds", None)
             source_clip_fea = source_image_embeds.get("clip_fea", clip_fea)
@@ -2481,6 +2482,12 @@ class WanVideoSampler:
                     context_pbar = ProgressBar(steps)
                     step_start_progress = idx
 
+                    # Validate all context windows before processing
+                    max_idx = latent_model_input.shape[1] if latent_model_input.ndim > 1 else 0
+                    for window_indices in context_queue:
+                        if not all(0 <= idx < max_idx for idx in window_indices):
+                            raise ValueError(f"Invalid context window indices {window_indices} for latent_model_input with shape {latent_model_input.shape}")
+
                     for i, c in enumerate(context_queue):
                         window_id = self.window_tracker.get_window_id(c)
                         
@@ -2495,7 +2502,7 @@ class WanVideoSampler:
                         
                         # Use the appropriate prompt for this section
                         if len(text_embeds["prompt_embeds"]) > 1:
-                            positive = text_embeds["prompt_embeds"][prompt_index]
+                            positive = [text_embeds["prompt_embeds"][prompt_index]]
                         else:
                             positive = text_embeds["prompt_embeds"]
 
@@ -2688,16 +2695,16 @@ class WanVideoSampler:
                                 block_swap_args = transformer_options.get("block_swap_args", None)
 
                             if block_swap_args is not None:
-                                transformer.use_non_blocking = block_swap_args.get("use_non_blocking", True)
+                                transformer.use_non_blocking = block_swap_args.get("use_non_blocking", False)
                                 for name, param in transformer.named_parameters():
                                     if "block" not in name:
                                         param.data = param.data.to(device)
                                     if "control_adapter" in name:
                                         param.data = param.data.to(device)
                                     elif block_swap_args["offload_txt_emb"] and "txt_emb" in name:
-                                        param.data = param.data.to(offload_device, non_blocking=transformer.use_non_blocking)
+                                        param.data = param.data.to(offload_device)
                                     elif block_swap_args["offload_img_emb"] and "img_emb" in name:
-                                        param.data = param.data.to(offload_device, non_blocking=transformer.use_non_blocking)
+                                        param.data = param.data.to(offload_device)
 
                                 transformer.block_swap(
                                     block_swap_args["blocks_to_swap"] - 1 ,
@@ -2864,19 +2871,18 @@ class WanVideoSampler:
 
                     if callback is not None:
                         if recammaster is not None:
-                            callback_latent = (latent_model_input[:, :orig_noise_len].to(device) - noise_pred[:, :orig_noise_len].to(device) * t.to(device) / 1000).detach().permute(1,0,2,3)
+                            callback_latent = (latent_model_input[:, :orig_noise_len].to(device) - noise_pred[:, :orig_noise_len].to(device) * t.to(device) / 1000).detach()
                         elif phantom_latents is not None:
-                            callback_latent = (latent_model_input[:,:-phantom_latents.shape[1]].to(device) - noise_pred[:,:-phantom_latents.shape[1]].to(device) * t.to(device) / 1000).detach().permute(1,0,2,3)
+                            callback_latent = (latent_model_input[:,:-phantom_latents.shape[1]].to(device) - noise_pred[:,:-phantom_latents.shape[1]].to(device) * t.to(device) / 1000).detach()
                         else:
-                            callback_latent = (latent_model_input.to(device) - noise_pred.to(device) * t.to(device) / 1000).detach().permute(1,0,2,3)
-                        callback(idx, callback_latent, None, len(timesteps))
+                            callback_latent = (latent_model_input.to(device) - noise_pred.to(device) * t.to(device) / 1000).detach()
+                        callback(idx, callback_latent.permute(1,0,2,3), None, len(timesteps))
                     else:
                         pbar.update(1)
-                    del latent_model_input, timestep
                 else:
                     if callback is not None:
-                        callback_latent = (zt_tgt.to(device) - vt_tgt.to(device) * t.to(device) / 1000).detach().permute(1,0,2,3)
-                        callback(idx, callback_latent, None, len(timesteps))
+                        callback_latent = (zt_tgt.to(device) - vt_tgt.to(device) * t.to(device) / 1000).detach()
+                        callback(idx, callback_latent.permute(1,0,2,3), None, len(timesteps))
                     else:
                         pbar.update(1)
 
@@ -2899,7 +2905,6 @@ class WanVideoSampler:
             torch.cuda.reset_peak_memory_stats(device)
         except:
             pass
-        print("samples out stats: mean", latent.mean().item(), "std", latent.std().item(), "min", latent.min().item(), "max", latent.max().item())
         return ({
             "samples": latent.unsqueeze(0).cpu(), 
             "looped": is_looped, 
@@ -2907,7 +2912,9 @@ class WanVideoSampler:
             "has_ref": has_ref, 
             "drop_last": drop_last,
             "generator_state": seed_g.get_state(),
-        },)
+        },{
+            "samples": callback_latent.unsqueeze(0).cpu(), 
+        })
 
 #region VideoDecode
 class WanVideoDecode:
