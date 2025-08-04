@@ -371,11 +371,12 @@ class WanVideoLoraSelect:
             low_mem_load = False  # Unmerged LoRAs don't need low_mem_load
         loras_list = []
 
-        strength = round(strength, 4)
-        if strength == 0.0:
-            if prev_lora is not None:
-                loras_list.extend(prev_lora)
-            return (loras_list,)
+        if not isinstance(strength, list):
+            strength = round(strength, 4)
+            if strength == 0.0:
+                if prev_lora is not None:
+                    loras_list.extend(prev_lora)
+                return (loras_list,)
 
         try:
             lora_path = folder_paths.get_full_path("loras", lora)
@@ -666,11 +667,16 @@ class WanVideoSetLoRAs:
             merge_loras = l.get("merge_loras", True)
         if merge_loras is True:
             raise ValueError("Set LoRA node does not use low_mem_load and can't merge LoRAs, disable 'merge_loras' in the LoRA select node.")
-
+        
+        patcher.model_options['transformer_options']["lora_scheduling_enabled"] = False
         for l in lora:
             log.info(f"Loading LoRA: {l['name']} with strength: {l['strength']}")
             lora_path = l["path"]
             lora_strength = l["strength"]
+            if isinstance(lora_strength, list):
+                if merge_loras:
+                    raise ValueError("LoRA strength should be a single value when merge_loras=True")
+                patcher.model_options['transformer_options']["lora_scheduling_enabled"] = True
             if lora_strength == 0:
                 log.warning(f"LoRA {lora_path} has strength 0, skipping...")
                 continue
@@ -1041,6 +1047,7 @@ class WanVideoModelLoader:
                 log.info("Using accelerate to load and assign model weights to device...")
                 param_count = sum(1 for _ in transformer.named_parameters())
                 pbar = ProgressBar(param_count)
+                cnt = 0
                 for name, param in tqdm(transformer.named_parameters(), 
                         desc=f"Loading transformer parameters to {transformer_load_device}", 
                         total=param_count,
@@ -1052,10 +1059,13 @@ class WanVideoModelLoader:
                     if "patch_embedding" in name:
                         dtype_to_use = torch.float32
                     set_module_tensor_to_device(transformer, name, device=transformer_load_device, dtype=dtype_to_use, value=sd[name])
-                    pbar.update(1)
+                    cnt += 1
+                    if cnt % 100 == 0:
+                        pbar.update(100)
 
                 #for name, param in transformer.named_parameters():
                 #    print(name, param.dtype, param.device, param.shape)
+                pbar.update_absolute(param_count)
 
         comfy_model.diffusion_model = transformer
         comfy_model.load_device = transformer_load_device
@@ -1069,6 +1079,10 @@ class WanVideoModelLoader:
                 log.info(f"Loading LoRA: {l['name']} with strength: {l['strength']}")
                 lora_path = l["path"]
                 lora_strength = l["strength"]
+                if isinstance(lora_strength, list):
+                    if merge_loras:
+                        raise ValueError("LoRA strength should be a single value when merge_loras=True")
+                    transformer.lora_scheduling_enabled = True
                 if lora_strength == 0:
                     log.warning(f"LoRA {lora_path} has strength 0, skipping...")
                     continue
@@ -1088,6 +1102,9 @@ class WanVideoModelLoader:
                 
                 if "diffusion_model.patch_embedding.lora_A.weight" in lora_sd:
                     log.info("Control-LoRA detected, patching model...")
+                    if not merge_loras:
+                        log.warning("Control-LoRA patching is only supported with merge_loras=True, setting it to True")
+                        merge_loras = True
                     control_lora = True
 
                     in_cls = transformer.patch_embedding.__class__ # nn.Conv3d
@@ -1111,7 +1128,6 @@ class WanVideoModelLoader:
                     
                     transformer.patch_embedding = new_in
                     transformer.expanded_patch_embedding = new_in
-                    transformer.register_to_config(in_dim=new_in_dim)
 
                 patcher, _ = load_lora_for_models(patcher, None, lora_sd, lora_strength, 0)
                 
@@ -1134,6 +1150,7 @@ class WanVideoModelLoader:
         
             patcher.model.diffusion_model = _replace_with_gguf_linear(patcher.model.diffusion_model, base_dtype, sd, patches=patcher.patches)
             pbar = ProgressBar(param_count)
+            cnt = 0
             for name, param in tqdm(patcher.model.diffusion_model.named_parameters(), 
                     desc=f"Loading transformer parameters to {transformer_load_device}", 
                     total=param_count,
@@ -1146,10 +1163,14 @@ class WanVideoModelLoader:
                 else:
                     dtype_to_use = base_dtype
                 set_module_tensor_to_device(patcher.model.diffusion_model, name, device=transformer_load_device, dtype=dtype_to_use, value=sd[name])
-                pbar.update(1)
+                cnt += 1
+                if cnt % 100 == 0:
+                    pbar.update(100)
+
             #for name, param in transformer.named_parameters():
             #    print(name, param.dtype, param.device, param.shape)
             #patcher.load(device, full_load=True)
+            pbar.update_absolute(param_count)
 
         patcher.model.is_patched = True
 
@@ -1387,6 +1408,13 @@ class LoadWanVideoT5TextEncoder:
 
         model_path = folder_paths.get_full_path("text_encoders", model_name)
         sd = load_torch_file(model_path, safe_load=True)
+
+        if quantization == "disabled":
+            for k, v in sd.items():
+                if isinstance(v, torch.Tensor):
+                    if v.dtype == torch.float8_e4m3fn:
+                        quantization = "fp8_e4m3fn"
+                        break
         
         if "token_embedding.weight" not in sd and "shared.weight" not in sd:
             raise ValueError("Invalid T5 text encoder model, this node expects the 'umt5-xxl' model")
