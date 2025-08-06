@@ -58,10 +58,10 @@ class DownloadAndLoadWav2VecModel:
                 ignore_patterns = ["*.bin", "*.h5"]
             elif model == "TencentGameMate/chinese-wav2vec2-base":
                 ignore_patterns = ["*.pt"]
-            if os.path.exists("/stable-diffusion-cache/models/hallo/wav2vec/wav2vec2-base-960h") and model == "facebook/wav2vec2-base-960h":
-                model_path = "/stable-diffusion-cache/models/hallo/wav2vec/wav2vec2-base-960h"
-            elif os.path.exists("/stable-diffusion-cache/huggingface/TencentGameMate/chinese-wav2vec2-base") and model == "TencentGameMate/chinese-wav2vec2-base":
-                model_path = "/stable-diffusion-cache/huggingface/TencentGameMate/chinese-wav2vec2-base"
+            if os.path.exists(os.path.join(folder_paths.cache_dir, "models/hallo/wav2vec/wav2vec2-base-960h")) and model == "facebook/wav2vec2-base-960h":
+                model_path = os.path.join(folder_paths.cache_dir, "models/hallo/wav2vec/wav2vec2-base-960h")
+            elif os.path.exists(os.path.join(folder_paths.cache_dir, "huggingface/TencentGameMate/chinese-wav2vec2-base")) and model == "TencentGameMate/chinese-wav2vec2-base":
+                model_path = os.path.join(folder_paths.cache_dir, "huggingface/TencentGameMate/chinese-wav2vec2-base")
             else:
                 snapshot_download(
                     repo_id=model,

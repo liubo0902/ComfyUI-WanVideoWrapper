@@ -4,6 +4,7 @@ from ..utils import log
 import comfy.model_management as mm
 from comfy.utils import ProgressBar
 from tqdm import tqdm
+import folder_paths
 
 def update_transformer(transformer, state_dict):
     
@@ -742,8 +743,8 @@ class WanVideoUniAnimateDWPoseDetector:
         model_pose=os.path.join(model_base_path, dw_pose_model)
 
         if not os.path.exists(model_det):
-            if os.path.exists("/stable-diffusion-cache/models/ckpts/hr16/yolox-onnx"):
-                model_det = os.path.join("/stable-diffusion-cache/models/ckpts/hr16/yolox-onnx", yolo_model)
+            if os.path.exists(os.path.join(folder_paths.cache_dir, "/models/ckpts/hr16/yolox-onnx")):
+                model_det = os.path.join(folder_paths.cache_dir, "/models/ckpts/hr16/yolox-onnx", yolo_model)
             else:
                 log.info(f"Downloading yolo model to: {model_base_path}")
                 from huggingface_hub import snapshot_download
@@ -753,8 +754,8 @@ class WanVideoUniAnimateDWPoseDetector:
                                     local_dir_use_symlinks=False)
             
         if not os.path.exists(model_pose):
-            if os.path.exists('/stable-diffusion-cache/models/ckpts/hr16/DWPose-TorchScript-BatchSize5'):
-                model_pose = os.path.join("/stable-diffusion-cache/models/ckpts/hr16/DWPose-TorchScript-BatchSize5", dw_pose_model)
+            if os.path.exists(os.path.join(folder_paths.cache_dir, "models/ckpts/hr16/DWPose-TorchScript-BatchSize5")):
+                model_pose = os.path.join(folder_paths.cache_dir, "models/ckpts/hr16/DWPose-TorchScript-BatchSize5", dw_pose_model)
             else:
                 log.info(f"Downloading dwpose model to: {model_base_path}")
                 from huggingface_hub import snapshot_download
