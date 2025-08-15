@@ -1,17 +1,17 @@
 import torch
+import torch.nn as nn
 import os, gc, uuid
 from .utils import log, apply_lora
 import numpy as np
 from tqdm import tqdm
 
-from .wanvideo.modules.model import WanModel
+from .wanvideo.modules.model import WanModel, LoRALinearLayer
 from .wanvideo.modules.t5 import T5EncoderModel
 from .wanvideo.modules.clip import CLIPModel
+from .wanvideo.wan_video_vae import WanVideoVAE, WanVideoVAE38
 
 from accelerate import init_empty_weights
 from .utils import set_module_tensor_to_device
-
-from .fp8_optimization import convert_linear_with_lora_and_scale
 
 import folder_paths
 import comfy.model_management as mm
@@ -275,6 +275,8 @@ class WanVideoBlockSwap:
             "optional": {
                 "use_non_blocking": ("BOOLEAN", {"default": False, "tooltip": "Use non-blocking memory transfer for offloading, reserves more RAM but is faster"}),
                 "vace_blocks_to_swap": ("INT", {"default": 0, "min": 0, "max": 15, "step": 1, "tooltip": "Number of VACE blocks to swap, the VACE model has 15 blocks"}),
+                "prefetch_blocks": ("INT", {"default": 0, "min": 0, "max": 40, "step": 1, "tooltip": "Number of blocks to prefetch ahead, can speed up processing but increases memory usage. 1 is usually enough to offset speed loss from block swapping, use the debug option to confirm it for your system"}),
+                "block_swap_debug": ("BOOLEAN", {"default": False, "tooltip": "Enable debug logging for block swapping"}),
             },
         }
     RETURN_TYPES = ("BLOCKSWAPARGS",)
@@ -423,7 +425,7 @@ class WanVideoLoraSelect:
         lora = {
             "path": lora_path,
             "strength": strength,
-            "name": lora.split(".")[0],
+            "name": os.path.splitext(lora)[0],
             "blocks": blocks.get("selected_blocks", {}),
             "layer_filter": blocks.get("layer_filter", ""),
             "low_mem_load": low_mem_load,
@@ -482,14 +484,13 @@ class WanVideoLoraSelectMulti:
             (lora_4, strength_4)
         ]
         for lora_name, strength in lora_inputs:
-            if not isinstance(strength, list):
-                s = round(strength, 4)
+            s = round(strength, 4) if not isinstance(strength, list) else strength
             if not lora_name or lora_name == "none" or s == 0.0:
                 continue
             loras_list.append({
                 "path": folder_paths.get_full_path("loras", lora_name),
                 "strength": s,
-                "name": lora_name.split(".")[0],
+                "name": os.path.splitext(lora_name)[0],
                 "blocks": blocks.get("selected_blocks", {}),
                 "layer_filter": blocks.get("layer_filter", ""),
                 "low_mem_load": low_mem_load,
@@ -688,6 +689,10 @@ class WanVideoSetLoRAs:
             lora_sd = standardize_lora_key_format(lora_sd)
             if l["blocks"]:
                 lora_sd = filter_state_dict_by_blocks(lora_sd, l["blocks"], l.get("layer_filter", []))
+
+            # Filter out any LoRA keys containing 'img' if the base model state_dict has no 'img' keys
+            if not any('img' in k for k in model.model.diffusion_model.state_dict().keys()):
+                lora_sd = {k: v for k, v in lora_sd.items() if 'img' not in k}
             
             if "diffusion_model.patch_embedding.lora_A.weight" in lora_sd:
                 raise NotImplementedError("Control LoRA patching is not implemented in this node.")
@@ -699,7 +704,7 @@ class WanVideoSetLoRAs:
         if 'transformer_options' not in patcher.model_options:
             patcher.model_options['transformer_options'] = {}
 
-        patcher.model_options['transformer_options']["linear_with_lora"] = True
+        patcher.model_options['transformer_options']["patch_linear"] = True
 
         return (patcher,)
 
@@ -712,7 +717,7 @@ class WanVideoModelLoader:
                 "model": (folder_paths.get_filename_list("unet_gguf") + folder_paths.get_filename_list("diffusion_models"), {"tooltip": "These models are loaded from the 'ComfyUI/models/diffusion_models' -folder",}),
 
             "base_precision": (["fp32", "bf16", "fp16", "fp16_fast"], {"default": "bf16"}),
-            "quantization": (["disabled", "fp8_e4m3fn", "fp8_e4m3fn_fast", "fp8_e5m2", "fp8_e4m3fn_fast_no_ffn", "fp8_e4m3fn_scaled", "fp8_e5m2_scaled"], {"default": "disabled", "tooltip": "optional quantization method"}),
+            "quantization": (["disabled", "fp8_e4m3fn", "fp8_e4m3fn_fast", "fp8_e4m3fn_scaled", "fp8_e4m3fn_scaled_fast", "fp8_e5m2", "fp8_e5m2_fast", "fp8_e5m2_scaled", "fp8_e5m2_scaled_fast"], {"default": "disabled", "tooltip": "optional quantization method"}),
             "load_device": (["main_device", "offload_device"], {"default": "main_device", "tooltip": "Initial device to load the model to, NOT recommended with the larger models unless you have 48GB+ VRAM"}),
             },
             "optional": {
@@ -732,6 +737,7 @@ class WanVideoModelLoader:
                 "vace_model": ("VACEPATH", {"default": None, "tooltip": "VACE model to use when not using model that has it included"}),
                 "fantasytalking_model": ("FANTASYTALKINGMODEL", {"default": None, "tooltip": "FantasyTalking model https://github.com/Fantasy-AMAP"}),
                 "multitalk_model": ("MULTITALKMODEL", {"default": None, "tooltip": "Multitalk model"}),
+                "fantasyportrait_model": ("FANTASYPORTRAITMODEL", {"default": None, "tooltip": "FantasyPortrait model"}),
             }
         }
 
@@ -741,7 +747,8 @@ class WanVideoModelLoader:
     CATEGORY = "WanVideoWrapper"
 
     def loadmodel(self, model, base_precision, load_device,  quantization,
-                  compile_args=None, attention_mode="sdpa", block_swap_args=None, lora=None, vram_management_args=None, vace_model=None, fantasytalking_model=None, multitalk_model=None):
+                  compile_args=None, attention_mode="sdpa", block_swap_args=None, lora=None, vram_management_args=None, vace_model=None, 
+                  fantasytalking_model=None, multitalk_model=None, fantasyportrait_model=None):
         assert not (vram_management_args is not None and block_swap_args is not None), "Can't use both block_swap_args and vram_management_args at the same time"
         
         lora_low_mem_load = merge_loras = False
@@ -849,6 +856,7 @@ class WanVideoModelLoader:
         ffn_dim = sd["blocks.0.ffn.0.bias"].shape[0]
         ffn2_dim = sd["blocks.0.ffn.2.weight"].shape[1]
 
+        model_type = "t2v"
         if not "text_embedding.0.weight" in sd:
             model_type = "no_cross_attn" #minimaxremover
         elif "model_type.Wan2_1-FLF2V-14B-720P" in sd or "img_emb.emb_pos" in sd or "flf2v" in model.lower():
@@ -965,7 +973,6 @@ class WanVideoModelLoader:
         #ReCamMaster
         if "blocks.0.cam_encoder.weight" in sd:
             log.info("ReCamMaster model detected, patching model...")
-            import torch.nn as nn
             for block in transformer.blocks:
                 block.cam_encoder = nn.Linear(12, dim)
                 block.projector = nn.Linear(dim, dim)
@@ -978,11 +985,25 @@ class WanVideoModelLoader:
         if fantasytalking_model is not None:
             log.info("FantasyTalking model detected, patching model...")
             context_dim = fantasytalking_model["sd"]["proj_model.proj.weight"].shape[0]
-            import torch.nn as nn
             for block in transformer.blocks:
                 block.cross_attn.k_proj = nn.Linear(context_dim, dim, bias=False)
                 block.cross_attn.v_proj = nn.Linear(context_dim, dim, bias=False)
             sd.update(fantasytalking_model["sd"])
+
+        # FantasyPortrait https://github.com/Fantasy-AMAP/fantasy-portrait/
+        if fantasyportrait_model is not None:
+            log.info("FantasyPortrait model detected, patching model...")
+            context_dim = fantasyportrait_model["sd"]["ip_adapter.blocks.0.cross_attn.ip_adapter_single_stream_k_proj.weight"].shape[1]
+
+            for block in transformer.blocks:
+                block.cross_attn.ip_adapter_single_stream_k_proj = nn.Linear(context_dim, dim, bias=False)
+                block.cross_attn.ip_adapter_single_stream_v_proj = nn.Linear(context_dim, dim, bias=False)
+            ip_adapter_sd = {}
+            for k, v in fantasyportrait_model["sd"].items():
+                if k.startswith("ip_adapter."):
+                    ip_adapter_sd[k.replace("ip_adapter.", "")] = v
+            sd.update(ip_adapter_sd)
+
         if multitalk_model is not None:
             # init audio module
             from .multitalk.multitalk import SingleStreamMultiAttention
@@ -1027,23 +1048,23 @@ class WanVideoModelLoader:
             model_type=comfy.model_base.ModelType.FLOW,
             device=device,
         )
-        
+        scale_weights = {}
         if not gguf:
-            
-            scale_weights = {}
-            if "scaled" in quantization:
-                scale_weights = {}
+            if "fp8" in quantization:
                 for k, v in sd.items():
                     if k.endswith(".scale_weight"):
                         scale_weights[k] = v
-
+            if not merge_loras:
+                from .custom_linear import _replace_linear
+                transformer = _replace_linear(transformer, base_dtype, sd, scale_weights=scale_weights)
+                
             if "fp8_e4m3fn" in quantization:
                 dtype = torch.float8_e4m3fn
             elif "fp8_e5m2" in quantization:
                 dtype = torch.float8_e5m2
             else:
                 dtype = base_dtype
-            params_to_keep = {"norm", "bias", "time_in", "patch_embedding", "time_", "img_emb", "modulation", "text_embedding", "adapter", "add"}
+            params_to_keep = {"norm", "bias", "time_in", "patch_embedding", "time_", "img_emb", "modulation", "text_embedding", "adapter", "add", "ref_conv"}
             if not lora_low_mem_load:
                 log.info("Using accelerate to load and assign model weights to device...")
                 param_count = sum(1 for _ in transformer.named_parameters())
@@ -1094,8 +1115,13 @@ class WanVideoModelLoader:
                     transformer = update_transformer(transformer, lora_sd)
 
                 lora_sd = standardize_lora_key_format(lora_sd)
+
                 if l["blocks"]:
                     lora_sd = filter_state_dict_by_blocks(lora_sd, l["blocks"], l.get("layer_filter", []))
+
+                # Filter out any LoRA keys containing 'img' if the base model state_dict has no 'img' keys
+                if not any('img' in k for k in sd.keys()):
+                    lora_sd = {k: v for k, v in lora_sd.items() if 'img' not in k}
 
                 #spacepxl's control LoRA patch
                 # for key in lora_sd.keys():
@@ -1130,7 +1156,20 @@ class WanVideoModelLoader:
                     transformer.patch_embedding = new_in
                     transformer.expanded_patch_embedding = new_in
 
-                patcher, _ = load_lora_for_models(patcher, None, lora_sd, lora_strength, 0)
+                if "diffusion_model.blocks.0.self_attn.q_loras.down.weight" in lora_sd:                        
+                    log.info("Stand-In LoRA detected")
+                    for block in transformer.blocks:
+                        block.self_attn.q_loras = LoRALinearLayer(dim, dim, rank=128, device=transformer_load_device, dtype=base_dtype, strength=lora_strength)
+                        block.self_attn.k_loras = LoRALinearLayer(dim, dim, rank=128, device=transformer_load_device, dtype=base_dtype, strength=lora_strength)
+                        block.self_attn.v_loras = LoRALinearLayer(dim, dim, rank=128, device=transformer_load_device, dtype=base_dtype, strength=lora_strength)
+                        for lora in [block.self_attn.q_loras, block.self_attn.k_loras, block.self_attn.v_loras]:
+                            for param in lora.parameters():
+                                param.requires_grad = False
+                    for name, param in transformer.named_parameters():
+                        if "lora" in name:
+                            param.data.copy_(lora_sd["diffusion_model." + name].to(param.device, dtype=param.dtype))
+                else:
+                    patcher, _ = load_lora_for_models(patcher, None, lora_sd, lora_strength, 0)
                 
                 del lora_sd
             
@@ -1140,6 +1179,8 @@ class WanVideoModelLoader:
                     patcher, device, transformer_load_device, 
                     params_to_keep=params_to_keep, dtype=dtype, base_dtype=base_dtype, state_dict=sd, 
                     low_mem_load=lora_low_mem_load, control_lora=control_lora, scale_weights=scale_weights)
+                scale_weights.clear()
+                patcher.patches.clear()
         
         if gguf:
             #from diffusers.quantizers.gguf.utils import _replace_with_gguf_linear, GGUFParameter
@@ -1156,6 +1197,8 @@ class WanVideoModelLoader:
                     desc=f"Loading transformer parameters to {transformer_load_device}", 
                     total=param_count,
                     leave=True):
+                if "loras" in name:
+                    continue
                 #print(name, param.dtype, param.device, param.shape)
                 if isinstance(param, GGUFParameter):
                     dtype_to_use = torch.uint8
@@ -1175,22 +1218,14 @@ class WanVideoModelLoader:
 
         patcher.model.is_patched = True
 
-
-        if "fast" in quantization:
-            if not merge_loras:
-                raise ValueError("FP8 fast quantization requires LoRAs to be merged into the model, please set merge_loras=True in the LoRA input")
-            from .fp8_optimization import convert_fp8_linear
-            if quantization == "fp8_e4m3fn_fast_no_ffn":
-                params_to_keep.update({"ffn"})
-            print(params_to_keep)
-            convert_fp8_linear(patcher.model.diffusion_model, base_dtype, params_to_keep=params_to_keep)
+        patch_linear = (True if "scaled" in quantization or (lora is not None and not merge_loras) else False)
         
-        if "scaled" in quantization and not merge_loras:
-            log.info("Using FP8 scaled linear quantization")
-            convert_linear_with_lora_and_scale(patcher.model.diffusion_model, scale_weights, patches=patcher.patches)
-        elif lora is not None and not merge_loras and not gguf:
-            log.info("LoRAs will be applied at runtime")
-            convert_linear_with_lora_and_scale(patcher.model.diffusion_model, patches=patcher.patches)
+        if "fast" in quantization:
+            if lora is not None and not merge_loras:
+                raise NotImplementedError("fp8_fast is not supported with unmerged LoRAs")
+            from .fp8_optimization import convert_fp8_linear
+            convert_fp8_linear(transformer, base_dtype, params_to_keep, scale_weight_keys=scale_weights)
+            patch_linear = False
 
         del sd
 
@@ -1255,16 +1290,18 @@ class WanVideoModelLoader:
         patcher.model["control_lora"] = control_lora
         patcher.model["compile_args"] = compile_args
         patcher.model["gguf"] = gguf
+        patcher.model["fp8_matmul"] = "fast" in quantization
+        patcher.model["scale_weights"] = scale_weights
 
         if 'transformer_options' not in patcher.model_options:
             patcher.model_options['transformer_options'] = {}
         patcher.model_options["transformer_options"]["block_swap_args"] = block_swap_args
-        patcher.model_options["transformer_options"]["linear_with_lora"] = True if not merge_loras else False
+        patcher.model_options["transformer_options"]["patch_linear"] = patch_linear
+        patcher.model_options["transformer_options"]["merge_loras"] = merge_loras
 
         for model in mm.current_loaded_models:
             if model._model() == patcher:
                 mm.current_loaded_models.remove(model)
-
         return (patcher,)
     
 # class WanVideoSaveModel:
@@ -1323,8 +1360,6 @@ class WanVideoVAELoader:
     DESCRIPTION = "Loads Wan VAE model from 'ComfyUI/models/vae'"
 
     def loadmodel(self, model_name, precision, compile_args=None):
-        from .wanvideo.wan_video_vae import WanVideoVAE, WanVideoVAE38
-
         dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[precision]
         #with open(os.path.join(script_directory, 'configs', 'hy_vae_config.json')) as f:
         #    vae_config = json.load(f)
