@@ -1012,6 +1012,9 @@ class WanVideoModelLoader:
             sd.update(ip_adapter_sd)
 
         if multitalk_model is not None:
+            if multitalk_model["is_gguf"] and not gguf:
+                raise ValueError("Multitalk/InfiniteTalk model is a GGUF model, main model also has to be a GGUF model.")
+            multitalk_model_type = multitalk_model.get("model_type", "MultiTalk")
             # init audio module
             from .multitalk.multitalk import SingleStreamMultiAttention
             from .wanvideo.modules.model import WanRMSNorm, WanLayerNorm
@@ -1031,10 +1034,10 @@ class WanVideoModelLoader:
                         attention_mode=attention_mode,
                     )
                 block.norm_x = WanLayerNorm(dim, transformer.eps, elementwise_affine=True) if norm_input_visual else nn.Identity()
-            log.info("MultiTalk model detected, patching model...")
-            
+            log.info(f"{multitalk_model_type} detected, patching model...")
+            transformer.audio_proj = multitalk_model["proj_model"]
+            transformer.multitalk_model_type = multitalk_model_type
             sd.update(multitalk_model["sd"])
-
         
         # Additional cond latents
         if "add_conv_in.weight" in sd:
@@ -1071,7 +1074,7 @@ class WanVideoModelLoader:
                 dtype = torch.float8_e5m2
             else:
                 dtype = base_dtype
-            params_to_keep = {"norm", "bias", "time_in", "patch_embedding", "time_", "img_emb", "modulation", "text_embedding", "adapter", "add", "ref_conv"}
+            params_to_keep = {"norm", "bias", "time_in", "patch_embedding", "time_", "img_emb", "modulation", "text_embedding", "adapter", "add", "ref_conv", "audio_proj"}
             if not lora_low_mem_load:
                 log.info("Using accelerate to load and assign model weights to device...")
                 param_count = sum(1 for _ in transformer.named_parameters())
@@ -1095,6 +1098,7 @@ class WanVideoModelLoader:
                 #for name, param in transformer.named_parameters():
                 #    print(name, param.dtype, param.device, param.shape)
                 pbar.update_absolute(param_count)
+                pbar.update_absolute(0)
 
         comfy_model.diffusion_model = transformer
         comfy_model.load_device = transformer_load_device
@@ -1235,9 +1239,6 @@ class WanVideoModelLoader:
             patch_linear = False
 
         del sd
-
-        if multitalk_model is not None:
-            transformer.audio_proj = multitalk_model["proj_model"]
 
         if vram_management_args is not None:
             if gguf:
