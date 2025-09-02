@@ -330,7 +330,7 @@ class WanVideoTorchCompileSettings:
     RETURN_NAMES = ("torch_compile_args",)
     FUNCTION = "set_args"
     CATEGORY = "WanVideoWrapper"
-    DESCRIPTION = "torch.compile settings, when connected to the model loader, torch.compile of the selected layers is attempted. Requires Triton and torch 2.5.0 is recommended"
+    DESCRIPTION = "torch.compile settings, when connected to the model loader, torch.compile of the selected layers is attempted. Requires Triton and torch > 2.7.0 is recommended"
 
     def set_args(self, backend, fullgraph, mode, dynamic, dynamo_cache_size_limit, compile_transformer_blocks_only, dynamo_recompile_limit=128):
 
@@ -1305,7 +1305,7 @@ class WanVideoModelLoader:
         if "fp8" in quantization:
             for k, v in sd.items():
                 if k.endswith(".scale_weight"):
-                    scale_weights[k] = v.to(base_dtype)
+                    scale_weights[k] = v.to(device, base_dtype)
         
         if "fp8_e4m3fn" in quantization:
             weight_dtype = torch.float8_e4m3fn
