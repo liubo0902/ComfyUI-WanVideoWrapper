@@ -1264,6 +1264,29 @@ class WanVideoAddControlEmbeds:
 
         return (updated,)
     
+class WanVideoAddPusaNoise:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+            "embeds": ("WANVIDIMAGE_EMBEDS",),
+            "noise_multipliers": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 100.0, "step": 0.01, "tooltip": "Noise multipliers for Pusa, can be a list of floats"}),
+            "noisy_steps": ("INT", {"default": -1, "min": -1, "max": 1000, "tooltip": "Number steps to apply the extra noise"}),
+            },
+        }
+
+    RETURN_TYPES = ("WANVIDIMAGE_EMBEDS", )
+    RETURN_NAMES = ("image_embeds",)
+    FUNCTION = "add"
+    CATEGORY = "WanVideoWrapper"
+    DESCRIPTION = "Adds latent and timestep noise multipliers when using flowmatch_pusa"
+
+    def add(self, embeds, noise_multipliers, noisy_steps):
+        updated = dict(embeds)
+        updated["pusa_noise_multipliers"] = noise_multipliers
+        updated["pusa_noisy_steps"] = noisy_steps
+
+        return (updated,)
+    
 class WanVideoSLG:
     @classmethod
     def INPUT_TYPES(s):
@@ -1649,29 +1672,36 @@ class WanVideoScheduler: #WIP
             try:
                 # Plot sigmas and save to a buffer
                 sigmas_np = sample_scheduler.full_sigmas.cpu().numpy()
-                if sample_scheduler.full_sigmas[-1].item() == 0:
-                    sigmas_np = sigmas_np[:-1]
+                if not np.isclose(sigmas_np[-1], 0.0, atol=1e-6):
+                    sigmas_np = np.append(sigmas_np, 0.0)
                 buf = io.BytesIO()
                 fig = plt.figure(facecolor='#353535')
                 ax = fig.add_subplot(111)
                 ax.set_facecolor('#353535')  # Set axes background color
-                # Create x-axis values starting from 1 instead of 0
-                x_values = range(1, len(sigmas_np) + 1)
+                x_values = range(0, len(sigmas_np))
                 ax.plot(x_values, sigmas_np)
+                # Annotate each sigma value
+                ax.scatter(x_values, sigmas_np, color='white', s=20, zorder=3)  # Small dots at each sigma
+                for x, y in zip(x_values, sigmas_np):
+                    if len(sigmas_np) <= 10:  # Only annotate if few steps
+                        ax.annotate(f"{y:.3f}", (x, y), textcoords="offset points", xytext=(10, 1), ha='center', color='orange', fontsize=12)
                 ax.set_xticks(x_values)
                 ax.set_title("Sigmas", color='white')           # Title font color
                 ax.set_xlabel("Step", color='white')            # X label font color
                 ax.set_ylabel("Sigma Value", color='white')     # Y label font color
-                ax.tick_params(axis='x', colors='white')        # X tick color
-                ax.tick_params(axis='y', colors='white')        # Y tick color
+                ax.tick_params(axis='x', colors='white', labelsize=10)        # X tick color
+                ax.tick_params(axis='y', colors='white', labelsize=10)        # Y tick color
                 # Add split point if end_step is defined
-                if end_idx != -1 and 0 <= end_idx < len(sigmas_np):
-                    ax.axvline(end_idx + 1, color='red', linestyle='--', linewidth=2, label='end_step split')
+                end_idx += 1
+                if end_idx != -1 and 0 <= end_idx < len(sigmas_np) - 1:
+                    ax.axvline(end_idx, color='red', linestyle='--', linewidth=2, label='end_step split')
                 # Add split point if start_step is defined
                 if start_idx > 0 and 0 <= start_idx < len(sigmas_np):
-                    ax.axvline(start_idx + 1, color='green', linestyle='--', linewidth=2, label='start_step split')
+                    ax.axvline(start_idx, color='green', linestyle='--', linewidth=2, label='start_step split')
                 if (end_idx != -1 and 0 <= end_idx < len(sigmas_np)) or (start_idx > 0 and 0 <= start_idx < len(sigmas_np)):
                     ax.legend()
+                if start_idx < end_idx and 0 <= start_idx < len(sigmas_np) and 0 < end_idx < len(sigmas_np):
+                    ax.axvspan(start_idx, end_idx, color='lightblue', alpha=0.1, label='Sampled Range')
                 plt.tight_layout()
                 plt.savefig(buf, format='png')
                 plt.close(fig)
@@ -1887,9 +1917,7 @@ class WanVideoSampler:
         #I2V
         image_cond = image_embeds.get("image_embeds", None)
         if image_cond is not None:
-            if is_pusa:
-                image_cond_mask = image_embeds.get("mask", None)
-            elif transformer.in_dim == 16:
+            if transformer.in_dim == 16:
                 raise ValueError("T2V (text to video) model detected, encoded images only work with I2V (Image to video) models")
             elif transformer.in_dim not in [48, 32]: # fun 2.1 models don't use the mask
                 image_cond_mask = image_embeds.get("mask", None)
@@ -2313,22 +2341,20 @@ class WanVideoSampler:
                 ).repeat(1, noise.shape[0], 1, 1, 1)
         
         # extra latents (Pusa) and 5b
-        latents_to_insert = add_index = None
+        latents_to_insert = add_index = noise_multipliers = None
         extra_latents = image_embeds.get("extra_latents", None)
-        if extra_latents is None:
-            if image_cond is not None and is_pusa: # get images for pusa if I2V node is used
-                extra_latents = image_cond
-                # Find indices where mask is 1
-                all_indices = torch.where(image_cond_mask[:, :, 0, 0].any(dim=0))[0].tolist()
-                num_extra_frames = len(all_indices)
-                if start_step == 0:
-                    for idx in all_indices:
-                        noise[:, idx] = extra_latents[:, idx].to(noise)
-                        log.info(f"Adding extra sample to latent index {idx}")
-                image_cond = None
-        elif extra_latents is not None and transformer.multitalk_model_type.lower() != "infinitetalk":
-            all_indices = []
-            for entry in extra_latents:
+        all_indices = []
+        noise_multiplier_list = image_embeds.get("pusa_noise_multipliers", None)
+        if noise_multiplier_list is not None:
+            if len(noise_multiplier_list) != latent_video_length:
+                noise_multipliers = torch.zeros(latent_video_length)
+            else:
+                noise_multipliers = torch.tensor(noise_multiplier_list)
+                log.info(f"Using Pusa noise multipliers: {noise_multipliers}")
+        if extra_latents is not None and transformer.multitalk_model_type.lower() != "infinitetalk":
+            if noise_multiplier_list is not None:
+                noise_multiplier_list = list(noise_multiplier_list) + [1.0] * (len(all_indices) - len(noise_multiplier_list))
+            for i, entry in enumerate(extra_latents):
                 add_index = entry["index"]
                 num_extra_frames = entry["samples"].shape[2]
                 # Handle negative indices
@@ -2339,6 +2365,10 @@ class WanVideoSampler:
                     noise[:, add_index:add_index+num_extra_frames] = entry["samples"].to(noise)
                     log.info(f"Adding extra samples to latent indices {add_index} to {add_index+num_extra_frames-1}")
                 all_indices.extend(range(add_index, add_index+num_extra_frames))
+            if noise_multipliers is not None and len(noise_multiplier_list) != latent_video_length:
+                for i, idx in enumerate(all_indices):
+                    noise_multipliers[idx] = noise_multiplier_list[i]
+                log.info(f"Using Pusa noise multipliers: {noise_multipliers}")
 
         latent = noise.to(device)
 
@@ -2996,6 +3026,10 @@ class WanVideoSampler:
             # Set latent for denoising
             latent = current_latent
 
+            if is_pusa and all_indices:
+                pusa_noisy_steps = image_embeds.get("pusa_noisy_steps", -1)
+                if pusa_noisy_steps == -1:
+                    pusa_noisy_steps = len(timesteps)
             try:
                 pbar = ProgressBar(len(timesteps))
                 #region main loop start
@@ -3022,11 +3056,28 @@ class WanVideoSampler:
                     current_step_percentage = idx / len(timesteps)
 
                     timestep = torch.tensor([t]).to(device)
-                    if is_pusa or (is_5b and 'all_indices' in locals()):
+                    if is_pusa or (is_5b and all_indices):
                         orig_timestep = timestep
                         timestep = timestep.unsqueeze(1).repeat(1, latent_video_length)
                         if extra_latents is not None:
-                            if 'all_indices' in locals() and all_indices:
+                            if all_indices and noise_multipliers is not None:
+                                if is_pusa:
+                                    scheduler_step_args["cond_frame_latent_indices"] = all_indices
+                                    scheduler_step_args["noise_multipliers"] = noise_multipliers
+                                for latent_idx in all_indices:
+                                    timestep[:, latent_idx] = timestep[:, latent_idx] * noise_multipliers[latent_idx]
+                                    # add noise for conditioning frames if multiplier > 0
+                                    if idx < pusa_noisy_steps and noise_multipliers[latent_idx] > 0:
+                                        latent_size = (1, latent.shape[0], latent.shape[1], latent.shape[2], latent.shape[3])
+                                        noise_for_cond = torch.randn(latent_size, generator=seed_g, device=torch.device("cpu"))
+                                        timestep_cond = torch.ones_like(timestep) * timestep.max()
+                                        if is_pusa:
+                                            latent[:, latent_idx:latent_idx+1] = sample_scheduler.add_noise_for_conditioning_frames(
+                                                latent[:, latent_idx:latent_idx+1].to(device),
+                                                noise_for_cond[:, :, latent_idx:latent_idx+1].to(device),
+                                                timestep_cond[:, latent_idx:latent_idx+1].to(device),
+                                                noise_multiplier=noise_multipliers[latent_idx])
+                            else:
                                 timestep[:, all_indices] = 0
                             #print("timestep: ", timestep)
 
@@ -4256,6 +4307,7 @@ NODE_CLASS_MAPPINGS = {
     "WanVideoAddControlEmbeds": WanVideoAddControlEmbeds,
     "WanVideoAddMTVMotion": WanVideoAddMTVMotion,
     "WanVideoRoPEFunction": WanVideoRoPEFunction,
+    "WanVideoAddPusaNoise": WanVideoAddPusaNoise
     }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoSampler": "WanVideo Sampler",
@@ -4291,4 +4343,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoAddControlEmbeds": "WanVideo Add Control Embeds",
     "WanVideoAddMTVMotion": "WanVideo MTV Crafter Motion",
     "WanVideoRoPEFunction": "WanVideo RoPE Function",
-    }
+    "WanVideoAddPusaNoise": "WanVideo Add Pusa Noise",
+}
