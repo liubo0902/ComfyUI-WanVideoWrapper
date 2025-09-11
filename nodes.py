@@ -5,6 +5,7 @@ import numpy as np
 from tqdm import tqdm
 import inspect
 import copy
+from PIL import Image
 import hashlib
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 
@@ -24,7 +25,7 @@ from contextlib import nullcontext
 from einops import rearrange
 
 from comfy import model_management as mm
-from comfy.utils import ProgressBar, common_upscale
+from comfy.utils import ProgressBar, common_upscale, load_torch_file
 from comfy.clip_vision import clip_preprocess, ClipVisionModel
 from comfy.cli_args import args, LatentPreviewMethod
 import folder_paths
@@ -2146,7 +2147,7 @@ class WanVideoSampler:
                 if random_ref_dwpose is not None:
                     random_ref_dwpose_data = transformer.randomref_embedding_pose(
                         random_ref_dwpose.to(device, dtype)
-                        ).unsqueeze(2).to(model["dtype"]) # [1, 20, 104, 60]
+                        ).unsqueeze(2).to(dtype) # [1, 20, 104, 60]
                 del random_ref_dwpose
                 
             unianim_data = {
@@ -2391,8 +2392,11 @@ class WanVideoSampler:
         pcd_data = pcd_data_input = None
         if uni3c_embeds is not None:
             transformer.controlnet = uni3c_embeds["controlnet"]
+            render_latent = uni3c_embeds["render_latent"].to(device)
+            if render_latent.shape != noise.shape:
+                render_latent = torch.nn.functional.interpolate(render_latent, size=(noise.shape[1], noise.shape[2], noise.shape[3]), mode='trilinear', align_corners=False)
             pcd_data = {
-                "render_latent": uni3c_embeds["render_latent"],
+                "render_latent": render_latent,
                 "render_mask": uni3c_embeds["render_mask"],
                 "camera_embedding": uni3c_embeds["camera_embedding"],
                 "controlnet_weight": uni3c_embeds["controlnet_weight"],
@@ -3376,6 +3380,7 @@ class WanVideoSampler:
                         log.info(f"Multitalk mode: {mode}")
                         cond_frame = None
                         offload = image_embeds.get("force_offload", False)
+                        offloaded = False
                         tiled_vae = image_embeds.get("tiled_vae", False)
                         frame_num = clip_length = image_embeds.get("num_frames", 81)
                         vae = image_embeds.get("vae", None)
@@ -3389,6 +3394,9 @@ class WanVideoSampler:
                         original_images = cond_image = image_embeds.get("multitalk_start_image", None)
                         if original_images is None:
                             original_images = torch.zeros([noise.shape[0], 1, target_h, target_w], device=device)
+
+                        output_path = image_embeds.get("output_path", "")
+                        img_counter = 0
 
                         if len(multitalk_embeds['audio_features'])==2 and (multitalk_embeds['ref_target_masks'] is None):
                             face_scale = 0.1
@@ -3428,13 +3436,27 @@ class WanVideoSampler:
                                 "end": uni3c_embeds["end"],
                             }
 
+                        encoded_silence = None
+                       
+                        try:
+                            silence_path = os.path.join(script_directory, "multitalk", "encoded_silence.safetensors")
+                            encoded_silence = load_torch_file(silence_path)["audio_emb"].to(dtype)
+                        except:
+                             log.warning("No encoded silence file found, padding with end of audio embedding instead.")
+
                         total_frames = len(audio_embedding[0])
                         estimated_iterations = total_frames // (frame_num - motion_frame) + 1
                         callback = prepare_callback(patcher, estimated_iterations)
 
+                        if frame_num >= total_frames:
+                            arrive_last_frame = True
+                            estimated_iterations = 1
+
                         log.info(f"Sampling {total_frames} frames in {estimated_iterations} windows, at {latent.shape[3]*vae_upscale_factor}x{latent.shape[2]*vae_upscale_factor} with {steps} steps")
 
                         while True: # start video generation iteratively
+                            self.cache_state = [None, None]
+
                             cur_motion_frames_latent_num = int(1 + (cur_motion_frames_num-1) // 4)
                             if mode == "infinitetalk":
                                 cond_image = original_images[:, :, current_condframe_index:current_condframe_index+1] if cond_image is not None else None
@@ -3552,11 +3574,16 @@ class WanVideoSampler:
                                 add_latent = add_noise(latent_motion_frames, motion_add_noise, timesteps[0])
                                 latent[:, :add_latent.shape[1]] = add_latent
 
-                            if offload:
+                            if offloaded:
+                                # Load weights
+                                if transformer.patched_linear and gguf_reader is None:
+                                    load_weights(patcher.model.diffusion_model, patcher.model["sd"], weight_dtype, base_dtype=dtype, transformer_load_device=device, block_swap_args=block_swap_args)
+                                elif gguf_reader is not None: #handle GGUF
+                                    load_weights(transformer, patcher.model["sd"], base_dtype=dtype, transformer_load_device=device, patcher=patcher, gguf=True, reader=gguf_reader, block_swap_args=block_swap_args)
+
                                 #blockswap init
                                 if not transformer.patched_linear:
                                     if block_swap_args is not None:
-                                        transformer.use_non_blocking = block_swap_args.get("use_non_blocking", False)
                                         for name, param in transformer.named_parameters():
                                             if "block" not in name:
                                                 param.data = param.data.to(device)
@@ -3705,6 +3732,7 @@ class WanVideoSampler:
                             del noise, latent_motion_frames
                             if offload:
                                 offload_transformer(transformer)
+                                offloaded = True
                             vae.to(device)
                             videos = vae.decode(latent.unsqueeze(0).to(device, vae.dtype), device=device, tiled=tiled_vae, pbar=False)[0].cpu()
                             vae.model.clear_cache()
@@ -3727,7 +3755,17 @@ class WanVideoSampler:
                         
                                 videos = torch.stack(cm_result_list, dim=0).permute(3, 0, 1, 2)
 
-                            # cache generated samples
+                            # optionally save generated samples to disk
+                            if output_path:
+                                video_np = videos.clamp(-1.0, 1.0).add(1.0).div(2.0).mul(255).cpu().float().numpy().transpose(1, 2, 3, 0).astype('uint8')
+                                num_frames_to_save = video_np.shape[0] if is_first_clip else video_np.shape[0] - cur_motion_frames_num
+                                log.info(f"Saving {num_frames_to_save} generated frames to {output_path}")
+                                start_idx = 0 if is_first_clip else cur_motion_frames_num
+                                for i in range(start_idx, video_np.shape[0]):
+                                    im = Image.fromarray(video_np[i])
+                                    im.save(os.path.join(output_path, f"frame_{img_counter:05d}.png"))
+                                    img_counter += 1
+                                
                             gen_video_list.append(videos if is_first_clip else videos[:, cur_motion_frames_num:])
 
                             current_condframe_index += 1
@@ -3761,9 +3799,14 @@ class WanVideoSampler:
                                         source_frame = len(audio_embedding[human_inx])
                                         source_frames.append(source_frame)
                                         if audio_end_idx >= len(audio_embedding[human_inx]):
-                                            miss_length   = audio_end_idx - len(audio_embedding[human_inx]) + 3 
-                                            add_audio_emb = torch.flip(audio_embedding[human_inx][-1*miss_length:], dims=[0])
-                                            audio_embedding[human_inx] = torch.cat([audio_embedding[human_inx], add_audio_emb], dim=0)
+                                            print(f"Audio embedding for subject {human_inx} not long enough: {len(audio_embedding[human_inx])}, need {audio_end_idx}, padding...")
+                                            miss_length = audio_end_idx - len(audio_embedding[human_inx]) + 3
+                                            print(f"Padding length: {miss_length}")
+                                            if encoded_silence is not None:
+                                                add_audio_emb = encoded_silence[-1*miss_length:]
+                                            else:
+                                                add_audio_emb = torch.flip(audio_embedding[human_inx][-1*miss_length:], dims=[0])
+                                            audio_embedding[human_inx] = torch.cat([audio_embedding[human_inx], add_audio_emb.to(device, dtype)], dim=0)
                                             miss_lengths.append(miss_length)
                                         else:
                                             miss_lengths.append(0)
