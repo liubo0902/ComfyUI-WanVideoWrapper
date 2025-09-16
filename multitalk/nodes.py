@@ -391,7 +391,7 @@ class WanVideoImageToVideoMultiTalk:
                     "multitalk",
                     "infinitetalk"
                 ], {"default": "auto", "tooltip": "The sampling strategy to use in the long video generation loop, should match the model used"}),
-                "output_path": ("STRING", {"default": "", "tooltip": "If set, will save each window's resulting frames to this folder"}),
+                "output_path": ("STRING", {"default": "", "tooltip": "If set, will save each window's resulting frames to this folder, also DISABLES returning the final video tensor to save memory"}),
 
             }
         }
@@ -428,7 +428,7 @@ class WanVideoImageToVideoMultiTalk:
         image_embeds = {
             "multitalk_sampling": True,
             "multitalk_start_image": resized_start_image if start_image is not None else None,
-            "num_frames": num_frames,
+            "frame_window_size": num_frames,
             "motion_frame": motion_frame,
             "target_h": H,
             "target_w": W,

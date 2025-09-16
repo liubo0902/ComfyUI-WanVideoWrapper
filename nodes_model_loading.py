@@ -558,7 +558,7 @@ class WanVideoExtraModelSelect:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "extra_model": (folder_paths.get_filename_list("diffusion_models"), {"tooltip": "These models are loaded from the 'ComfyUI/models/diffusion_models' path to extra state dict to add to the main model"}),
+                "extra_model": (folder_paths.get_filename_list("unet_gguf") + folder_paths.get_filename_list("diffusion_models"), {"tooltip": "These models are loaded from the 'ComfyUI/models/diffusion_models' path to extra state dict to add to the main model"}),
             },
         }
 
@@ -761,7 +761,7 @@ class WanVideoSetLoRAs:
 def load_weights(transformer, sd=None, weight_dtype=None, base_dtype=None, 
                  transformer_load_device=None, block_swap_args=None, gguf=False, reader=None, patcher=None):
     params_to_keep = {"time_in", "patch_embedding", "time_", "modulation", "text_embedding", 
-                      "adapter", "add", "ref_conv", "casual_audio_encoder", "cond_encoder", "frame_packer"}
+                      "adapter", "add", "ref_conv", "casual_audio_encoder", "cond_encoder", "frame_packer", "audio_proj_glob"}
     param_count = sum(1 for _ in transformer.named_parameters())
     pbar = ProgressBar(param_count)
     cnt = 0
@@ -783,15 +783,18 @@ def load_weights(transformer, sd=None, weight_dtype=None, base_dtype=None,
         for r in reader:
             all_tensors.extend(r.tensors)
         for tensor in all_tensors:
+            name = tensor.name
+            if "glob" not in name and "audio_proj" in name:
+                name = name.replace("audio_proj", "multitalk_audio_proj")
             load_device = device
-            if "vace_blocks." in tensor.name:
+            if "vace_blocks." in name:
                 try:
-                    vace_block_idx = int(tensor.name.split("vace_blocks.")[1].split(".")[0])
+                    vace_block_idx = int(name.split("vace_blocks.")[1].split(".")[0])
                 except Exception:
                     vace_block_idx = None
-            elif "blocks." in tensor.name:
+            elif "blocks." in name:
                 try:
-                    block_idx = int(tensor.name.split("blocks.")[1].split(".")[0])
+                    block_idx = int(name.split("blocks.")[1].split(".")[0])
                 except Exception:
                     block_idx = None
 
@@ -805,7 +808,7 @@ def load_weights(transformer, sd=None, weight_dtype=None, base_dtype=None,
                         
             is_gguf_quant = tensor.tensor_type not in [GGMLQuantizationType.F32, GGMLQuantizationType.F16]
             weights = torch.from_numpy(tensor.data.copy()).to(load_device)
-            sd[tensor.name] = GGUFParameter(weights, quant_type=tensor.tensor_type) if is_gguf_quant else weights
+            sd[name] = GGUFParameter(weights, quant_type=tensor.tensor_type) if is_gguf_quant else weights
         sd.update(extra_sd)
         del all_tensors, extra_sd
 
@@ -1078,11 +1081,13 @@ class WanVideoModelLoader:
         if extra_model is not None:
             if gguf:
                 if not extra_model["path"].endswith(".gguf"):
-                    raise ValueError("With GGUF main model the extra model must also be a GGUF quantized, if the main model already has extra included, you can disconnect the extra module loader")
+                    raise ValueError("With GGUF main model the extra model must also be GGUF quantized, if the main model already has VACE included, you can disconnect the extra module loader")
                 extra_sd, extra_reader = load_gguf(extra_model["path"])
                 gguf_reader.append(extra_reader)
                 del extra_reader
             else:
+                if extra_model["path"].endswith(".gguf"):
+                    raise ValueError("With GGUF extra model the main model must also be GGUF quantized model")
                 extra_sd = load_torch_file(extra_model["path"], device=transformer_load_device, safe_load=True)
             sd.update(extra_sd)
             del extra_sd
@@ -1109,6 +1114,8 @@ class WanVideoModelLoader:
         log.info(f"Detected model in_channels: {in_channels}")
         ffn_dim = sd["blocks.0.ffn.0.bias"].shape[0]
         ffn2_dim = sd["blocks.0.ffn.2.weight"].shape[1]
+
+        is_humo = "audio_proj.audio_proj_glob_1.layer.weight" in sd
 
         model_type = "t2v"
         if "audio_injector.injector.0.k.weight" in sd:
@@ -1224,6 +1231,7 @@ class WanVideoModelLoader:
             "enable_adain": True if "audio_injector.injector_adain_layers.0.linear.weight" in sd else False,
             "cond_dim": sd["cond_encoder.weight"].shape[1] if "cond_encoder.weight" in sd else 0,
             "zero_timestep": model_type == "s2v",
+            "humo_audio": is_humo,
 
         }
 
@@ -1293,16 +1301,21 @@ class WanVideoModelLoader:
                         class_interval=4,
                         attention_mode=attention_mode,
                     )
-            transformer.audio_proj = multitalk_model["proj_model"]
+            transformer.multitalk_audio_proj = multitalk_model["proj_model"]
             transformer.multitalk_model_type = multitalk_model_type
 
             extra_model_path = multitalk_model["model_path"]
+            extra_sd = {}
             if multitalk_model_path.endswith(".gguf"):
-                extra_sd, extra_reader = load_gguf(extra_model_path)
+                extra_sd_temp, extra_reader = load_gguf(extra_model_path)
                 gguf_reader.append(extra_reader)
                 del extra_reader
             else:
-                extra_sd = load_torch_file(extra_model_path, device=transformer_load_device, safe_load=True)
+                extra_sd_temp = load_torch_file(extra_model_path, device=transformer_load_device, safe_load=True)
+                
+            for k, v in extra_sd_temp.items():
+                extra_sd[k.replace("audio_proj.", "multitalk_audio_proj.")] = v
+                
             sd.update(extra_sd)
             del extra_sd
 
@@ -1386,9 +1399,6 @@ class WanVideoModelLoader:
                 raise NotImplementedError("fp8_fast is not supported with unmerged LoRAs")
             from .fp8_optimization import convert_fp8_linear
             convert_fp8_linear(transformer, base_dtype, params_to_keep, scale_weight_keys=scale_weights)
-
-        if multitalk_model is not None:
-            transformer.audio_proj = multitalk_model["proj_model"]
 
         if vram_management_args is not None:
             if gguf:

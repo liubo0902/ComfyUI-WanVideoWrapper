@@ -1917,6 +1917,7 @@ class WanVideoSampler:
         fun_or_fl2v_model = has_ref = drop_last = False
         phantom_latents = fun_ref_image = ATI_tracks = None
         add_cond = attn_cond = attn_cond_neg = noise_pred_flipped = None
+        humo_audio = humo_audio_neg = None
 
         #I2V
         image_cond = image_embeds.get("image_embeds", None)
@@ -2103,6 +2104,33 @@ class WanVideoSampler:
             phantom_start_percent = image_embeds.get("phantom_start_percent", 0.0)
             phantom_end_percent = image_embeds.get("phantom_end_percent", 1.0)
 
+
+        #HuMo inputs
+        humo_audio = image_embeds.get("humo_audio_emb", None)
+        humo_audio_neg = image_embeds.get("humo_audio_emb_neg", None)
+        humo_reference_count = image_embeds.get("humo_reference_count", 0)
+        num_frames = image_embeds.get("num_frames", 0)
+        if humo_audio is not None:
+            from .HuMo.nodes import get_audio_emb_window
+            if not multitalk_sampling:
+                humo_audio, _ = get_audio_emb_window(humo_audio, num_frames, frame0_idx=0)
+                zero_audio_pad = torch.zeros(humo_reference_count, *humo_audio.shape[1:]).to(humo_audio.device)
+                humo_audio = torch.cat([humo_audio, zero_audio_pad], dim=0)
+                humo_audio_neg = torch.zeros_like(humo_audio, dtype=humo_audio.dtype, device=humo_audio.device)
+            humo_audio = humo_audio.to(device, dtype)
+        
+        if humo_audio_neg is not None:
+            humo_audio_neg = humo_audio_neg.to(device, dtype)
+        humo_audio_scale = image_embeds.get("humo_audio_scale", 1.0)
+        humo_image_cond = image_embeds.get("humo_image_cond", None)
+        humo_image_cond_neg = image_embeds.get("humo_image_cond_neg", None)
+        
+        humo_audio_cfg_scale = image_embeds.get("humo_audio_cfg_scale", 1.0)
+        humo_start_percent = image_embeds.get("humo_start_percent", 0.0)
+        humo_end_percent = image_embeds.get("humo_end_percent", 1.0)
+        if not isinstance(humo_audio_cfg_scale, list):
+            humo_audio_cfg_scale = [humo_audio_cfg_scale] * (steps + 1)
+
         latent_video_length = noise.shape[1]
 
         # Initialize FreeInit filter if enabled
@@ -2159,7 +2187,7 @@ class WanVideoSampler:
             }
 
         # FantasyTalking
-        audio_proj = multitalk_audio_embedding = None
+        audio_proj = multitalk_audio_embeds = None
         audio_scale = 1.0
         if fantasytalking_embeds is not None:
             audio_proj = fantasytalking_embeds["audio_proj"].to(device)
@@ -2172,13 +2200,13 @@ class WanVideoSampler:
             # Handle single or multiple speaker embeddings
             audio_features_in = multitalk_embeds.get("audio_features", None)
             if audio_features_in is None:
-                multitalk_audio_embedding = None
+                multitalk_audio_embeds = None
             else:
                 if isinstance(audio_features_in, list):
-                    multitalk_audio_embedding = [emb.to(device, dtype) for emb in audio_features_in]
+                    multitalk_audio_embeds = [emb.to(device, dtype) for emb in audio_features_in]
                 else:
                     # keep backward-compatibility with single tensor input
-                    multitalk_audio_embedding = [audio_features_in.to(device, dtype)]
+                    multitalk_audio_embeds = [audio_features_in.to(device, dtype)]
 
             audio_scale = multitalk_embeds.get("audio_scale", 1.0)
             audio_cfg_scale = multitalk_embeds.get("audio_cfg_scale", 1.0)
@@ -2186,7 +2214,7 @@ class WanVideoSampler:
             if not isinstance(audio_cfg_scale, list):
                 audio_cfg_scale = [audio_cfg_scale] * (steps + 1)
 
-            shapes = [tuple(e.shape) for e in multitalk_audio_embedding]
+            shapes = [tuple(e.shape) for e in multitalk_audio_embeds]
             log.info(f"Multitalk audio features shapes (per speaker): {shapes}")
 
         # FantasyPortrait
@@ -2609,7 +2637,8 @@ class WanVideoSampler:
         def predict_with_cfg(z, cfg_scale, positive_embeds, negative_embeds, timestep, idx, image_cond=None, clip_fea=None, 
                              control_latents=None, vace_data=None, unianim_data=None, audio_proj=None, control_camera_latents=None, 
                              add_cond=None, cache_state=None, context_window=None, multitalk_audio_embeds=None, fantasy_portrait_input=None, reverse_time=False,
-                             mtv_motion_tokens=None, s2v_audio_input=None, s2v_ref_motion=None, s2v_motion_frames=[1, 0], s2v_pose=None):
+                             mtv_motion_tokens=None, s2v_audio_input=None, s2v_ref_motion=None, s2v_motion_frames=[1, 0], s2v_pose=None, 
+                             humo_image_cond=None, humo_image_cond_neg=None, humo_audio=None, humo_audio_neg=None):
             nonlocal transformer
             z = z.to(dtype)
             autocast_enabled = ("fp8" in model["quantization"] and not transformer.patched_linear)
@@ -2654,6 +2683,16 @@ class WanVideoSampler:
                 elif ATI_tracks is not None and ((ati_start_percent <= current_step_percentage <= ati_end_percent) or 
                               (ati_end_percent > 0 and idx == 0 and current_step_percentage >= ati_start_percent)):
                     image_cond_input = image_cond_ati.to(z)
+                elif humo_image_cond is not None:
+                    if context_window is not None:
+                        image_cond_input = humo_image_cond[:, context_window].to(z)
+                        humo_image_cond_neg_input = humo_image_cond_neg[:, context_window].to(z)
+                        if humo_reference_count > 0:
+                            image_cond_input[:, -humo_reference_count:] = humo_image_cond[:, -humo_reference_count:]
+                            humo_image_cond_neg_input[:, -humo_reference_count:] = humo_image_cond_neg[:, -humo_reference_count:]
+                    else:
+                        image_cond_input = humo_image_cond.to(z)
+                        humo_image_cond_neg_input = humo_image_cond_neg.to(z)
                 elif image_cond is not None:
                     if reverse_time: # Flip the image condition
                         image_cond_input = torch.cat([
@@ -2717,8 +2756,8 @@ class WanVideoSampler:
                     else:
                         z = torch.cat([z, minimax_latents, minimax_mask_latents], dim=0)
                 
-                if not multitalk_sampling and multitalk_audio_embedding is not None:
-                    audio_embedding = multitalk_audio_embedding
+                if not multitalk_sampling and multitalk_audio_embeds is not None:
+                    audio_embedding = multitalk_audio_embeds
                     audio_embs = []
                     indices = (torch.arange(4 + 1) - 2) * 1
                     human_num = len(audio_embedding)
@@ -2759,12 +2798,32 @@ class WanVideoSampler:
                             (s2v_pose_end_percent > 0 and idx == 0 and current_step_percentage >= s2v_pose_start_percent)):
                         s2v_pose = None
 
+                
+                if humo_audio is not None and ((humo_start_percent <= current_step_percentage <= humo_end_percent) or \
+                            (humo_end_percent > 0 and idx == 0 and current_step_percentage >= humo_start_percent)):
+                    if context_window is None:
+                        humo_audio_input = humo_audio
+                        humo_audio_input_neg = humo_audio_neg if humo_audio_neg is not None else None
+                    else:
+                        humo_audio_input = humo_audio[context_window].to(z)
+                        if humo_audio_neg is not None:
+                            humo_audio_input_neg = humo_audio_neg[context_window].to(z)
+                        else:
+                            humo_audio_input_neg = None
+                else:
+                    humo_audio_input = humo_audio_input_neg = None
+
                 base_params = {
+                    'x': [z], # latent
+                    'y': [image_cond_input] if image_cond_input is not None else None, # image cond
+                    'clip_fea': clip_fea, # clip features
                     'seq_len': seq_len, # sequence length
                     'device': device, # main device
                     'freqs': freqs, # rope freqs
                     't': timestep, # current timestep
+                    'is_uncond': False, # is unconditional
                     'current_step': idx, # current step
+                    'current_step_percentage': current_step_percentage, # current step percentage
                     'last_step': len(timesteps) - 1 == idx, # is last step
                     'control_lora_enabled': control_lora_enabled, # control lora toggle for patch embed selection
                     'enhance_enabled': enhance_enabled, # enhance-a-video toggle
@@ -2779,8 +2838,8 @@ class WanVideoSampler:
                     "add_cond": add_cond_input, # additional conditioning input
                     "nag_params": text_embeds.get("nag_params", {}), # normalized attention guidance
                     "nag_context": text_embeds.get("nag_prompt_embeds", None), # normalized attention guidance context
-                    "multitalk_audio": multitalk_audio_input if multitalk_audio_embedding is not None else None, # Multi/InfiniteTalk audio input
-                    "ref_target_masks": ref_target_masks if multitalk_audio_embedding is not None else None, # Multi/InfiniteTalk reference target masks
+                    "multitalk_audio": multitalk_audio_input if multitalk_audio_embeds is not None else None, # Multi/InfiniteTalk audio input
+                    "ref_target_masks": ref_target_masks if multitalk_audio_embeds is not None else None, # Multi/InfiniteTalk reference target masks
                     "inner_t": [shot_len] if shot_len else None, # inner timestep for EchoShot
                     "standin_input": standin_input, # Stand-in reference input
                     "fantasy_portrait_input": fantasy_portrait_input, # Fantasy portrait input
@@ -2796,7 +2855,9 @@ class WanVideoSampler:
                     "s2v_ref_motion": s2v_ref_motion, # speech-to-video reference motion latent
                     "s2v_audio_scale": s2v_audio_scale if s2v_audio_input is not None else 1.0, # speech-to-video audio scale
                     "s2v_pose": s2v_pose if s2v_pose is not None else None, # speech-to-video pose control
-                    "s2v_motion_frames": s2v_motion_frames, # speech-to-video motion frames
+                    "s2v_motion_frames": s2v_motion_frames, # speech-to-video motion frames,
+                    "humo_audio": humo_audio_input, # humo audio input
+                    "humo_audio_scale": humo_audio_scale if humo_audio is not None else 1.0, # humo audio scale
                 }
 
                 batch_size = 1
@@ -2809,98 +2870,88 @@ class WanVideoSampler:
 
                 try:
                     if not batched_cfg:
-                        #cond
+                        #conditional (positive) pass
                         noise_pred_cond, cache_state_cond = transformer(
-                            [z], context=positive_embeds, y=[image_cond_input] if image_cond_input is not None else None,
-                            clip_fea=clip_fea, is_uncond=False, current_step_percentage=current_step_percentage,
+                            context=positive_embeds,
                             pred_id=cache_state[0] if cache_state else None,
                             vace_data=vace_data, attn_cond=attn_cond,
                             **base_params
                         )
-                        noise_pred_cond = noise_pred_cond[0].to(intermediate_device)
+                        noise_pred_cond = noise_pred_cond[0]
                         if math.isclose(cfg_scale, 1.0):
                             if use_fresca:
-                                noise_pred_cond = fourier_filter(
-                                    noise_pred_cond,
-                                    scale_low=fresca_scale_low,
-                                    scale_high=fresca_scale_high,
-                                    freq_cutoff=fresca_freq_cutoff,
-                                )
+                                noise_pred_cond = fourier_filter(noise_pred_cond, fresca_scale_low, fresca_scale_high, fresca_freq_cutoff)
                             return noise_pred_cond, [cache_state_cond]
-                        #uncond
-                        if fantasytalking_embeds is not None:
-                            if not math.isclose(audio_cfg_scale[idx], 1.0):
-                                base_params['audio_proj'] = None
+                        
+                        #unconditional (negative) pass
+                        base_params['is_uncond'] = True
+                        base_params['clip_fea'] = clip_fea_neg if clip_fea_neg is not None else clip_fea
+                        if humo_audio_input_neg is not None:
+                            base_params['humo_audio'] = humo_audio_input_neg
+                        
                         noise_pred_uncond, cache_state_uncond = transformer(
-                            [z], context=negative_embeds, clip_fea=clip_fea_neg if clip_fea_neg is not None else clip_fea,
-                            y=[image_cond_input] if image_cond_input is not None else None, 
-                            is_uncond=True, current_step_percentage=current_step_percentage,
+                            context=negative_embeds if humo_audio_input_neg is None else positive_embeds, #ti
                             pred_id=cache_state[1] if cache_state else None,
                             vace_data=vace_data, attn_cond=attn_cond_neg,
-                            **base_params
-                        )
-                        noise_pred_uncond = noise_pred_uncond[0].to(intermediate_device)
+                            **base_params)
+                        noise_pred_uncond = noise_pred_uncond[0]
+
+                        # HuMo
+                        if humo_audio_input_neg is not None and not math.isclose(humo_audio_cfg_scale[idx], 1.0):
+                            if cache_state is not None and len(cache_state) != 3:
+                                cache_state.append(None)
+                            if t > 980 and humo_image_cond_neg_input is not None: # use image cond for first timesteps
+                                base_params['y'] = [humo_image_cond_neg_input]
+                            
+                            noise_pred_humo_audio_uncond, cache_state_humo = transformer(
+                            context=negative_embeds, pred_id=cache_state[2] if cache_state else None, vace_data=None,
+                            **base_params)
+
+                            noise_pred = (noise_pred_uncond + humo_audio_cfg_scale[idx] * (noise_pred_cond - noise_pred_humo_audio_uncond[0]) 
+                                          + (cfg_scale - 2.0) * (noise_pred_humo_audio_uncond[0] - noise_pred_uncond))
+                            return noise_pred, [cache_state_cond, cache_state_uncond, cache_state_humo]
                         #phantom
                         if use_phantom and not math.isclose(phantom_cfg_scale[idx], 1.0):
                             noise_pred_phantom, cache_state_phantom = transformer(
-                            [z], context=negative_embeds, clip_fea=clip_fea_neg if clip_fea_neg is not None else clip_fea,
-                            y=[image_cond_input] if image_cond_input is not None else None, 
-                            is_uncond=True, current_step_percentage=current_step_percentage,
-                            pred_id=cache_state[2] if cache_state else None,
-                            vace_data=None,
-                            **base_params
-                        )
-                            noise_pred_phantom = noise_pred_phantom[0].to(intermediate_device)
-                            
-                            noise_pred = noise_pred_uncond + phantom_cfg_scale[idx] * (noise_pred_phantom - noise_pred_uncond) + cfg_scale * (noise_pred_cond - noise_pred_phantom)
+                            context=negative_embeds, pred_id=cache_state[2] if cache_state else None, vace_data=None,
+                            **base_params)
+
+                            noise_pred = (noise_pred_uncond + phantom_cfg_scale[idx] * (noise_pred_phantom[0] - noise_pred_uncond)
+                                          + cfg_scale * (noise_pred_cond - noise_pred_phantom[0]))
                             return noise_pred, [cache_state_cond, cache_state_uncond, cache_state_phantom]
-                        #fantasytalking
-                        if fantasytalking_embeds is not None:
+                        #audio cfg (fantasytalking and multitalk)
+                        if (fantasytalking_embeds is not None or multitalk_audio_embeds is not None):
                             if not math.isclose(audio_cfg_scale[idx], 1.0):
                                 if cache_state is not None and len(cache_state) != 3:
                                     cache_state.append(None)
-                                base_params['audio_proj'] = None
+                                
+                                # Set audio parameters to None/zeros based on type
+                                if fantasytalking_embeds is not None:
+                                    base_params['audio_proj'] = None
+                                    audio_context = positive_embeds
+                                else:  # multitalk
+                                    base_params['multitalk_audio'] = torch.zeros_like(multitalk_audio_input)[-1:]
+                                    audio_context = negative_embeds
+                                
                                 noise_pred_no_audio, cache_state_audio = transformer(
-                                    [z], context=positive_embeds, y=[image_cond_input] if image_cond_input is not None else None,
-                                    clip_fea=clip_fea, is_uncond=False, current_step_percentage=current_step_percentage,
+                                    context=audio_context, is_uncond=False,
                                     pred_id=cache_state[2] if cache_state else None,
                                     vace_data=vace_data,
-                                    **base_params
-                                )
-                                noise_pred_no_audio = noise_pred_no_audio[0].to(intermediate_device)
-                                noise_pred = (
-                                    noise_pred_uncond
-                                    + cfg_scale * (noise_pred_no_audio - noise_pred_uncond)
-                                    + audio_cfg_scale[idx] * (noise_pred_cond - noise_pred_no_audio)
-                                    )
-                                return noise_pred, [cache_state_cond, cache_state_uncond, cache_state_audio]
-                        elif multitalk_audio_embedding is not None:
-                            if not math.isclose(audio_cfg_scale[idx], 1.0):
-                                if cache_state is not None and len(cache_state) != 3:
-                                    cache_state.append(None)
-                                base_params['multitalk_audio'] = torch.zeros_like(multitalk_audio_input)[-1:]
-                                noise_pred_no_audio, cache_state_audio = transformer(
-                                    [z], context=negative_embeds, y=[image_cond_input] if image_cond_input is not None else None,
-                                    clip_fea=clip_fea, is_uncond=False, current_step_percentage=current_step_percentage,
-                                    pred_id=cache_state[2] if cache_state else None,
-                                    vace_data=vace_data,
-                                    **base_params
-                                )
-                                noise_pred_no_audio = noise_pred_no_audio[0].to(intermediate_device)
-                                noise_pred = (
-                                    noise_pred_no_audio
-                                    + cfg_scale * (noise_pred_cond - noise_pred_uncond)
-                                    + audio_cfg_scale[idx] * (noise_pred_uncond - noise_pred_no_audio)
-                                    )
+                                    **base_params)
+
+                                noise_pred = (noise_pred_uncond
+                                    + cfg_scale * (noise_pred_no_audio[0] - noise_pred_uncond)
+                                    + audio_cfg_scale[idx] * (noise_pred_cond - noise_pred_no_audio[0]))
                                 return noise_pred, [cache_state_cond, cache_state_uncond, cache_state_audio]
 
                     #batched
                     else:
+                        base_params['z'] = [z] * 2
+                        base_params['y'] = [image_cond_input] * 2 if image_cond_input is not None else None
+                        base_params['clip_fea'] = torch.cat([clip_fea, clip_fea], dim=0)
                         cache_state_uncond = None
                         [noise_pred_cond, noise_pred_uncond], cache_state_cond = transformer(
-                            [z] + [z], context=positive_embeds + negative_embeds, 
-                            y=[image_cond_input] + [image_cond_input] if image_cond_input is not None else None,
-                            clip_fea=clip_fea.repeat(2,1,1), is_uncond=False, current_step_percentage=current_step_percentage,
+                            context=positive_embeds + negative_embeds, is_uncond=False,
                             pred_id=cache_state[0] if cache_state else None,
                             **base_params
                         )
@@ -2919,7 +2970,6 @@ class WanVideoSampler:
                         noise_pred_uncond.view(batch_size, -1)
                     ).view(batch_size, 1, 1, 1)
                     
-                
                 noise_pred_uncond_scaled = noise_pred_uncond * alpha
 
                 if use_tangential:
@@ -2932,18 +2982,12 @@ class WanVideoSampler:
 
                 #https://github.com/WikiChao/FreSca
                 if use_fresca:
-                    filtered_cond = fourier_filter(
-                        noise_pred_cond - noise_pred_uncond,
-                        scale_low=fresca_scale_low,
-                        scale_high=fresca_scale_high,
-                        freq_cutoff=fresca_freq_cutoff,
-                    )
+                    filtered_cond = fourier_filter(noise_pred_cond - noise_pred_uncond, fresca_scale_low, fresca_scale_high, fresca_freq_cutoff)
                     noise_pred = noise_pred_uncond_scaled + cfg_scale * filtered_cond * alpha
                 else:
                     noise_pred = noise_pred_uncond_scaled + cfg_scale * (noise_pred_cond - noise_pred_uncond_scaled)
                 del noise_pred_uncond_scaled, noise_pred_cond, noise_pred_uncond
                 
-
                 return noise_pred, [cache_state_cond, cache_state_uncond]
 
         if args.preview_method in [LatentPreviewMethod.Auto, LatentPreviewMethod.Latent2RGB]: #default for latent2rgb
@@ -3362,7 +3406,8 @@ class WanVideoSampler:
                                 text_embeds["negative_prompt_embeds"], 
                                 partial_timestep, idx, partial_img_emb, clip_fea, partial_control_latents, partial_vace_context, partial_unianim_data,partial_audio_proj,
                                 partial_control_camera_latents, partial_add_cond, current_teacache, context_window=c, fantasy_portrait_input=partial_fantasy_portrait_input,
-                                mtv_motion_tokens=partial_mtv_motion_tokens, s2v_audio_input=partial_s2v_audio_input, s2v_motion_frames=[1, 0], s2v_pose=partial_s2v_pose)
+                                mtv_motion_tokens=partial_mtv_motion_tokens, s2v_audio_input=partial_s2v_audio_input, s2v_motion_frames=[1, 0], s2v_pose=partial_s2v_pose,
+                                humo_image_cond=humo_image_cond, humo_image_cond_neg=humo_image_cond_neg, humo_audio=humo_audio, humo_audio_neg=humo_audio_neg,)
 
                             if cache_args is not None:
                                 self.window_tracker.cache_states[window_id] = new_teacache
@@ -3382,7 +3427,7 @@ class WanVideoSampler:
                         offload = image_embeds.get("force_offload", False)
                         offloaded = False
                         tiled_vae = image_embeds.get("tiled_vae", False)
-                        frame_num = clip_length = image_embeds.get("num_frames", 81)
+                        frame_num = clip_length = image_embeds.get("frame_window_size", 81)
                         vae = image_embeds.get("vae", None)
                         clip_embeds = image_embeds.get("clip_context", None)
                         if clip_embeds is not None:
@@ -3420,9 +3465,10 @@ class WanVideoSampler:
                         indices = (torch.arange(4 + 1) - 2) * 1
                         current_condframe_index = 0
 
-                        audio_embedding = multitalk_audio_embedding
+                        audio_embedding = multitalk_audio_embeds
                         human_num = len(audio_embedding)
                         audio_embs = None
+                        cond_frame = None
                         
                         pcd_data = pcd_data_input = None
                         if uni3c_embeds is not None:
@@ -3530,9 +3576,11 @@ class WanVideoSampler:
                                     masks = (1-noise_mask.repeat(len(timesteps), 1, 1, 1, 1).to(device)) > thresholds
 
                             # zero padding and vae encode for img cond
-                            if cond_image is not None:
-                                video_frames = torch.zeros(1, 3, frame_num-cond_image.shape[2], target_h, target_w, device=device, dtype=vae.dtype)
-                                padding_frames_pixels_values = torch.concat([cond_image.to(device, vae.dtype), video_frames], dim=2)
+                            if cond_image is not None or cond_frame is not None:
+                                cond_ = cond_image if is_first_clip else cond_frame
+                                cond_frame_num = cond_.shape[2]
+                                video_frames = torch.zeros(1, 3, frame_num-cond_frame_num, target_h, target_w, device=device, dtype=vae.dtype)
+                                padding_frames_pixels_values = torch.concat([cond_.to(device, vae.dtype), video_frames], dim=2)
 
                                 # encode
                                 vae.to(device)
@@ -3554,6 +3602,25 @@ class WanVideoSampler:
                             else:
                                 y = None
                                 latent_motion_frames = noise[:, :1]
+
+                            partial_humo_cond_input = partial_humo_cond_neg_input = partial_humo_audio = partial_humo_audio_neg = None
+                            if humo_image_cond is not None:
+                                partial_humo_cond_input = humo_image_cond[:, :latent_frame_num]
+                                partial_humo_cond_neg_input = humo_image_cond_neg[:, :latent_frame_num]
+                                if y is not None:
+                                    partial_humo_cond_input[:, :1] = y[:, :1]
+                                if humo_reference_count > 0:
+                                    partial_humo_cond_input[:, -humo_reference_count:] = humo_image_cond[:, -humo_reference_count:]
+                                    partial_humo_cond_neg_input[:, -humo_reference_count:] = humo_image_cond_neg[:, -humo_reference_count:]
+ 
+                            if humo_audio is not None:
+                                if is_first_clip:
+                                    audio_embs = None
+                                
+                                partial_humo_audio, _ = get_audio_emb_window(humo_audio, frame_num, frame0_idx=audio_start_idx)
+                                #zero_audio_pad = torch.zeros(humo_reference_count, *partial_humo_audio.shape[1:], device=partial_humo_audio.device, dtype=partial_humo_audio.dtype)
+                                partial_humo_audio[-humo_reference_count:] = 0
+                                partial_humo_audio_neg = torch.zeros_like(partial_humo_audio, device=partial_humo_audio.device, dtype=partial_humo_audio.dtype)
 
                             if scheduler == "multitalk":
                                 timesteps = list(np.linspace(1000, 1, steps, dtype=np.float32))
@@ -3689,12 +3756,14 @@ class WanVideoSampler:
                                 timestep = timesteps[i]
                                 latent_model_input = latent.to(device)
                                 if mode == "infinitetalk":
-                                    latent_model_input[:, :cur_motion_frames_latent_num] = latent_motion_frames
+                                    if humo_image_cond is None or not is_first_clip:
+                                        latent_model_input[:, :cur_motion_frames_latent_num] = latent_motion_frames
 
                                 noise_pred, self.cache_state = predict_with_cfg(
                                     latent_model_input, cfg[min(i, len(timesteps)-1)], positive, text_embeds["negative_prompt_embeds"],
                                     timestep, i, y, clip_embeds, control_latents, window_vace_data, partial_unianim_data, audio_proj, control_camera_latents, add_cond,
-                                    cache_state=self.cache_state, multitalk_audio_embeds=audio_embs, fantasy_portrait_input=partial_fantasy_portrait_input)
+                                    cache_state=self.cache_state, multitalk_audio_embeds=audio_embs, fantasy_portrait_input=partial_fantasy_portrait_input, 
+                                    humo_image_cond=partial_humo_cond_input, humo_image_cond_neg=partial_humo_cond_neg_input, humo_audio=partial_humo_audio, humo_audio_neg=partial_humo_audio_neg)
 
                                 if callback is not None:
                                     callback_latent = (latent_model_input.to(device) - noise_pred.to(device) * t.to(device) / 1000).detach().permute(1,0,2,3)
@@ -3727,12 +3796,15 @@ class WanVideoSampler:
                                     add_latent = add_noise(latent_motion_frames, motion_add_noise, timesteps[i+1])
                                     latent[:, :add_latent.shape[1]] = add_latent
                                 else:
-                                    latent[:, :cur_motion_frames_latent_num] = latent_motion_frames
+                                    if humo_image_cond is None or not is_first_clip:
+                                        latent[:, :cur_motion_frames_latent_num] = latent_motion_frames
 
                             del noise, latent_motion_frames
                             if offload:
                                 offload_transformer(transformer)
                                 offloaded = True
+                            if humo_image_cond is not None and humo_reference_count > 0:
+                                latent = latent[:,:-humo_reference_count]
                             vae.to(device)
                             videos = vae.decode(latent.unsqueeze(0).to(device, vae.dtype), device=device, tiled=tiled_vae, pbar=False)[0].cpu()
                             vae.model.clear_cache()
@@ -3765,8 +3837,8 @@ class WanVideoSampler:
                                     im = Image.fromarray(video_np[i])
                                     im.save(os.path.join(output_path, f"frame_{img_counter:05d}.png"))
                                     img_counter += 1
-                                
-                            gen_video_list.append(videos if is_first_clip else videos[:, cur_motion_frames_num:])
+                            else:
+                                gen_video_list.append(videos if is_first_clip else videos[:, cur_motion_frames_num:])
 
                             current_condframe_index += 1
                             iteration_count += 1
@@ -3789,7 +3861,7 @@ class WanVideoSampler:
 
                             # Repeat audio emb
                             if multitalk_embeds is not None:
-                                audio_start_idx += (frame_num - cur_motion_frames_num)
+                                audio_start_idx += (frame_num - cur_motion_frames_num - humo_reference_count)
                                 audio_end_idx = audio_start_idx + clip_length
                                 if audio_end_idx >= len(audio_embedding[0]):
                                     arrive_last_frame = True
@@ -3814,8 +3886,11 @@ class WanVideoSampler:
                                     last_frame = original_images[:, :, -1:, :, :]
                                     miss_length   = 1
                                     original_images = torch.cat([original_images, last_frame.repeat(1, 1, miss_length, 1, 1)], dim=2)
-
-                        gen_video_samples = torch.cat(gen_video_list, dim=1)
+                        
+                        if not output_path:
+                            gen_video_samples = torch.cat(gen_video_list, dim=1)
+                        else:
+                            gen_video_samples = torch.zeros(3, 1, 64, 64) # dummy output
 
                         if force_offload:
                             if not model["auto_cpu_offload"]:
@@ -3825,7 +3900,7 @@ class WanVideoSampler:
                             torch.cuda.reset_peak_memory_stats(device)
                         except:
                             pass
-                        return {"video": gen_video_samples.permute(1, 2, 3, 0)},
+                        return {"video": gen_video_samples.permute(1, 2, 3, 0), "output_path": output_path},
                     # region framepack loop
                     elif framepack:
                         framepack_out = []
@@ -3972,7 +4047,8 @@ class WanVideoSampler:
                             cfg[idx], text_embeds["prompt_embeds"], 
                             text_embeds["negative_prompt_embeds"], 
                             timestep, idx, image_cond, clip_fea, control_latents, vace_data, unianim_data, audio_proj, control_camera_latents, add_cond,
-                            cache_state=self.cache_state, fantasy_portrait_input=fantasy_portrait_input, mtv_motion_tokens=mtv_motion_tokens, s2v_audio_input=s2v_audio_input)
+                            cache_state=self.cache_state, fantasy_portrait_input=fantasy_portrait_input, multitalk_audio_embeds=multitalk_audio_embeds, mtv_motion_tokens=mtv_motion_tokens, s2v_audio_input=s2v_audio_input,
+                            humo_image_cond=humo_image_cond, humo_image_cond_neg=humo_image_cond_neg, humo_audio=humo_audio, humo_audio_neg=humo_audio_neg)
                         if bidirectional_sampling:
                             noise_pred_flipped, self.cache_state = predict_with_cfg(
                             latent_model_input_flipped, 
@@ -4055,6 +4131,8 @@ class WanVideoSampler:
                                 callback_latent = (latent_model_input[:, :orig_noise_len].to(device) - noise_pred[:, :orig_noise_len].to(device) * t.to(device) / 1000).detach()
                             #elif phantom_latents is not None:
                             #    callback_latent = (latent_model_input[:,:-phantom_latents.shape[1]].to(device) - noise_pred[:,:-phantom_latents.shape[1]].to(device) * t.to(device) / 1000).detach()
+                            elif humo_image_cond is not None and humo_reference_count > 0:
+                                callback_latent = (latent_model_input[:,:-humo_reference_count].to(device) - noise_pred[:,:-humo_reference_count].to(device) * t.to(device) / 1000).detach()
                             else:
                                 callback_latent = (latent_model_input.to(device) - noise_pred.to(device) * t.to(device) / 1000).detach()
                             callback(idx, callback_latent.permute(1,0,2,3), None, len(timesteps))
@@ -4075,6 +4153,8 @@ class WanVideoSampler:
 
         if phantom_latents is not None:
             latent = latent[:,:-phantom_latents.shape[1]]
+        if humo_image_cond is not None and humo_reference_count > 0:
+            latent = latent[:,:-humo_reference_count]
         
         cache_states = None
         if cache_args is not None:
@@ -4248,7 +4328,10 @@ class WanVideoEncodeLatentBatch:
 
         latent_list = []
         for img in images:
-            latent = vae.encode(img.unsqueeze(0).unsqueeze(0).permute(0, 4, 1, 2, 3), device=device, tiled=enable_vae_tiling, tile_size=(tile_x//vae.upsampling_factor, tile_y//vae.upsampling_factor), tile_stride=(tile_stride_x//vae.upsampling_factor, tile_stride_y//vae.upsampling_factor))
+            if enable_vae_tiling and tile_x is not None:
+                latent = vae.encode(img.unsqueeze(0).unsqueeze(0).permute(0, 4, 1, 2, 3), device=device, tiled=enable_vae_tiling, tile_size=(tile_x//vae.upsampling_factor, tile_y//vae.upsampling_factor), tile_stride=(tile_stride_x//vae.upsampling_factor, tile_stride_y//vae.upsampling_factor))
+            else:
+                latent = vae.encode(img.unsqueeze(0).unsqueeze(0).permute(0, 4, 1, 2, 3), device=device, tiled=enable_vae_tiling)
             vae.model.clear_cache()
             if latent_strength != 1.0:
                 latent *= latent_strength
