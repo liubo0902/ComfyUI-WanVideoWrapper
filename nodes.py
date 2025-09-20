@@ -85,9 +85,7 @@ def init_blockswap(transformer, block_swap_args, model):
     if not transformer.patched_linear:
         if block_swap_args is not None:
             for name, param in transformer.named_parameters():
-                if "block" not in name:
-                    param.data = param.data.to(device)
-                if "control_adapter" in name:
+                if "block" not in name or "control_adapter" in name or "face" in name:
                     param.data = param.data.to(device)
                 elif block_swap_args["offload_txt_emb"] and "txt_emb" in name:
                     param.data = param.data.to(offload_device)
@@ -1020,7 +1018,6 @@ class WanVideoImageToVideoEncode:
 
         vae.to(device)
         y = vae.encode([concatenated], device, end_=(end_image is not None and not fun_or_fl2v_model),tiled=tiled_vae)[0]
-        vae.model.clear_cache()
         del concatenated
 
         has_ref = False
@@ -1116,14 +1113,20 @@ class WanVideoAnimateEmbeds:
         lat_w = W // vae.upsampling_factor
 
         num_refs = ref_images.shape[0] if ref_images is not None else 0
-
         num_frames = ((num_frames - 1) // 4) * 4 + 1
-        target_shape = (16, (num_frames - 1) // 4 + 1 + num_refs, lat_h, lat_w)
-        latent_window_size = ((frame_window_size - 1) // 4) + 1
 
         looping = num_frames > frame_window_size
+
+        if num_frames < frame_window_size:
+            frame_window_size = num_frames
+
+        target_shape = (16, (num_frames - 1) // 4 + 1 + num_refs, lat_h, lat_w)
+        latent_window_size = ((frame_window_size - 1) // 4)
+
         if not looping:
             num_frames = num_frames + num_refs * 4
+        else:
+            latent_window_size = latent_window_size + 1
 
         vae.to(device)
         # Resize and rearrange the input image dimensions
@@ -1136,6 +1139,8 @@ class WanVideoAnimateEmbeds:
                 resized_pose_images = pose_images.permute(3, 0, 1, 2) # C, T, H, W
             resized_pose_images = resized_pose_images * 2 - 1
             pose_latents = vae.encode([resized_pose_images.to(device, vae.dtype)], device,tiled=tiled_vae)
+            pose_latents = pose_latents.to(offload_device)
+            
             if not looping and pose_latents.shape[2] < latent_window_size:
                 log.info(f"WanAnimate: Padding pose latents from {pose_latents.shape} to length {latent_window_size}")
                 pad_len = latent_window_size - pose_latents.shape[2]
@@ -1150,13 +1155,15 @@ class WanVideoAnimateEmbeds:
                 resized_bg_images = common_upscale(bg_images.movedim(-1, 1), W, H, "lanczos", "disabled").movedim(0, 1)
             else:
                 resized_bg_images = bg_images.permute(3, 0, 1, 2) # C, T, H, W
-            resized_bg_images = resized_bg_images[:3] * 2 - 1
-            if not looping:
-                bg_latents = vae.encode([resized_bg_images.to(device, vae.dtype)], device,tiled=tiled_vae)[0]
-                print("bg_latents", bg_latents.shape)
-                del resized_bg_images
-            else:
-                resized_bg_images = resized_bg_images.to(offload_device, dtype=vae.dtype)
+            resized_bg_images = (resized_bg_images[:3] * 2 - 1)
+
+        if not looping:
+            if bg_images is None:
+                resized_bg_images = torch.zeros(3, num_frames - num_refs, H, W, device=device, dtype=vae.dtype)
+            bg_latents = vae.encode([resized_bg_images.to(device, vae.dtype)], device,tiled=tiled_vae)[0].to(offload_device)
+            del resized_bg_images
+        elif bg_images is not None:
+            resized_bg_images = resized_bg_images.to(offload_device, dtype=vae.dtype)
 
         if ref_images is not None:
             if ref_images.shape[1] != H or ref_images.shape[2] != W:
@@ -1165,42 +1172,31 @@ class WanVideoAnimateEmbeds:
                 resized_ref_images = ref_images.permute(3, 0, 1, 2) # C, T, H, W
             resized_ref_images = resized_ref_images[:3] * 2 - 1
 
-            if looping or bg_images is not None: # looping or when using background, encode refs separately
-                ref_latent = vae.encode([resized_ref_images.to(device, vae.dtype)], device,tiled=tiled_vae)[0]
-                msk = torch.zeros(4, 1, lat_h, lat_w, device=device, dtype=vae.dtype)
-                msk[:, :1] = 1
-                ref_latent_masked = torch.cat([msk, ref_latent], dim=0) # 4+C 1 H W
-                msk = torch.zeros(4, (frame_window_size - 1) // 4 + 1, lat_h, lat_w, device=device, dtype=vae.dtype)
-
-            if bg_images is None:
-                zero_frames = torch.zeros(3, num_frames - num_refs, H, W, device=device, dtype=vae.dtype)
-                concatenated = torch.cat([resized_ref_images.to(device, dtype=vae.dtype), zero_frames], dim=1)
-                del zero_frames
-                ref_latent = vae.encode([concatenated.to(device, vae.dtype)], device,tiled=tiled_vae)[0]
-                del concatenated
-                print("ref_latent", ref_latent.shape)
+            ref_latent = vae.encode([resized_ref_images.to(device, vae.dtype)], device,tiled=tiled_vae)[0]
+            msk = torch.zeros(4, 1, lat_h, lat_w, device=device, dtype=vae.dtype)
+            msk[:, :num_refs] = 1
+            ref_latent_masked = torch.cat([msk, ref_latent], dim=0).to(offload_device) # 4+C 1 H W
 
             if mask is None:
-                ref_mask = torch.zeros(1, num_frames, lat_h, lat_w, device=device, dtype=vae.dtype)
+                bg_mask = torch.zeros(1, num_frames, lat_h, lat_w, device=offload_device, dtype=vae.dtype)
             else:
-                ref_mask = 1 - mask[:num_frames]
-                ref_mask = common_upscale(ref_mask.unsqueeze(1), lat_w, lat_h, "nearest", "disabled").squeeze(1)
-                ref_mask = ref_mask.to(vae.dtype).to(device)
-                ref_mask = ref_mask.unsqueeze(-1).permute(3, 0, 1, 2) # C, T, H, W
+                bg_mask = 1 - mask[:num_frames]
+                if bg_mask.shape[0] < num_frames and not looping:
+                    bg_mask = torch.cat([bg_mask, bg_mask[-1:].repeat(num_frames - bg_mask.shape[0], 1, 1)], dim=0)
+                bg_mask = common_upscale(bg_mask.unsqueeze(1), lat_w, lat_h, "nearest", "disabled").squeeze(1)
+                bg_mask = bg_mask.unsqueeze(-1).permute(3, 0, 1, 2).to(offload_device, vae.dtype) # C, T, H, W
             
-            if bg_images is None:
-                ref_mask[:, :num_refs] = 1
-            ref_mask_mask_repeated = torch.repeat_interleave(ref_mask[:, 0:1], repeats=4, dim=1) # T, C, H, W
-            ref_mask = torch.cat([ref_mask_mask_repeated, ref_mask[:, 1:]], dim=1)
-            ref_mask = ref_mask.view(1, ref_mask.shape[1] // 4, 4, lat_h, lat_w) # 1, T, C, H, W
-            ref_mask = ref_mask.movedim(1, 2)[0]# C, T, H, W
+            if bg_images is None and looping:
+                bg_mask[:, :num_refs] = 1
+            bg_mask_mask_repeated = torch.repeat_interleave(bg_mask[:, 0:1], repeats=4, dim=1) # T, C, H, W
+            bg_mask = torch.cat([bg_mask_mask_repeated, bg_mask[:, 1:]], dim=1)
+            bg_mask = bg_mask.view(1, bg_mask.shape[1] // 4, 4, lat_h, lat_w) # 1, T, C, H, W
+            bg_mask = bg_mask.movedim(1, 2)[0]# C, T, H, W
 
             if not looping:
-                if bg_images is not None:
-                    bg_latents_masked = torch.cat([ref_mask, bg_latents], dim=0)
-                    ref_latent = torch.cat([ref_latent_masked, bg_latents_masked], dim=1)
-                else:
-                    ref_latent = torch.cat([ref_mask, ref_latent], dim=0)
+                bg_latents_masked = torch.cat([bg_mask[:, :bg_latents.shape[1]], bg_latents], dim=0)
+                del bg_mask, bg_latents
+                ref_latent = torch.cat([ref_latent_masked, bg_latents_masked], dim=1)
             else:
                 ref_latent = ref_latent_masked
 
@@ -1211,11 +1207,8 @@ class WanVideoAnimateEmbeds:
             else:
                 resized_face_images = face_images.permute(3, 0, 1, 2) # B, C, T, H, W
             resized_face_images = (resized_face_images * 2 - 1).unsqueeze(0)
-        else:
-            resized_face_images = torch.zeros(1, 3, num_frames, 512, 512, device=device, dtype=torch.float32)
-        resized_face_images = resized_face_images.to(offload_device, dtype=vae.dtype)
+            resized_face_images = resized_face_images.to(offload_device, dtype=vae.dtype)
 
-        vae.model.clear_cache()
 
         seq_len = math.ceil((target_shape[2] * target_shape[3]) / 4 * target_shape[1])
         
@@ -1230,10 +1223,10 @@ class WanVideoAnimateEmbeds:
             "max_seq_len": seq_len,
             "pose_latents": pose_latents,
             "bg_images": resized_bg_images if bg_images is not None and looping else None,
-            "ref_masks": ref_mask if mask is not None and looping else None,
+            "ref_masks": bg_mask if mask is not None and looping else None,
             "ref_latent": ref_latent,
             "ref_image": resized_ref_images if ref_images is not None else None,
-            "face_pixels": resized_face_images,
+            "face_pixels": resized_face_images if face_images is not None else None,
             "num_frames": num_frames,
             "target_shape": target_shape,
             "frame_window_size": frame_window_size,
@@ -1615,7 +1608,7 @@ class WanVideoVACEEncode:
 
         vae = vae.to(device)
         z0 = self.vace_encode_frames(vae, input_frames, ref_images, masks=input_masks, tiled_vae=tiled_vae)
-        vae.model.clear_cache()
+        
         m0 = self.vace_encode_masks(input_masks, ref_images)
         z = self.vace_latent(z0, m0)
         vae.to(offload_device)
@@ -1656,7 +1649,7 @@ class WanVideoVACEEncode:
             reactive = vae.encode(reactive, device=device, tiled=tiled_vae)
             latents = [torch.cat((u, c), dim=0) for u, c in zip(inactive, reactive)]
             del inactive, reactive
-        vae.model.clear_cache()
+        
         
         cat_latents = []
         for latent, refs in zip(latents, ref_images):
@@ -2365,12 +2358,15 @@ class WanVideoSampler:
         # WanAnim inputs
         frame_window_size = image_embeds.get("frame_window_size", 77)
         wananimate_loop = image_embeds.get("looping", False)
+        if wananimate_loop and context_options is not None:
+            raise Exception("context_options are not compatible or necessary with WanAnim looping, since it creates the video in a loop.")
         wananim_pose_latents = image_embeds.get("pose_latents", None)
         wananim_pose_strength = image_embeds.get("pose_strength", 1.0)
         wananim_face_strength = image_embeds.get("face_strength", 1.0)
         wananim_face_pixels = image_embeds.get("face_pixels", None)
         if image_cond is None:
             image_cond = image_embeds.get("ref_latent", None)
+            has_ref = image_cond is not None or has_ref
 
         latent_video_length = noise.shape[1]
 
@@ -2658,13 +2654,13 @@ class WanVideoSampler:
                 controlnet["controlnet_stride"] = controlnet["control_stride"]
 
         #uni3c
-        pcd_data = pcd_data_input = None
+        uni3c_data = uni3c_data_input = None
         if uni3c_embeds is not None:
             transformer.controlnet = uni3c_embeds["controlnet"]
             render_latent = uni3c_embeds["render_latent"].to(device)
             if render_latent.shape != noise.shape:
                 render_latent = torch.nn.functional.interpolate(render_latent, size=(noise.shape[1], noise.shape[2], noise.shape[3]), mode='trilinear', align_corners=False)
-            pcd_data = {
+            uni3c_data = {
                 "render_latent": render_latent,
                 "render_mask": uni3c_embeds["render_mask"],
                 "camera_embedding": uni3c_embeds["camera_embedding"],
@@ -2849,7 +2845,7 @@ class WanVideoSampler:
                              add_cond=None, cache_state=None, context_window=None, multitalk_audio_embeds=None, fantasy_portrait_input=None, reverse_time=False,
                              mtv_motion_tokens=None, s2v_audio_input=None, s2v_ref_motion=None, s2v_motion_frames=[1, 0], s2v_pose=None, 
                              humo_image_cond=None, humo_image_cond_neg=None, humo_audio=None, humo_audio_neg=None, wananim_pose_latents=None,
-                             wananim_face_pixels=None):
+                             wananim_face_pixels=None, uni3c_data=None,):
             nonlocal transformer
             z = z.to(dtype)
             autocast_enabled = ("fp8" in model["quantization"] and not transformer.patched_linear)
@@ -2996,13 +2992,13 @@ class WanVideoSampler:
                 elif multitalk_sampling and multitalk_audio_embeds is not None:
                     multitalk_audio_input = multitalk_audio_embeds
                 
-                if context_window is not None and pcd_data is not None and pcd_data["render_latent"].shape[2] != context_frames:
-                    pcd_data_input = {"render_latent": pcd_data["render_latent"][:, :, context_window]}
-                    for k in pcd_data:
+                if context_window is not None and uni3c_data is not None and uni3c_data["render_latent"].shape[2] != context_frames:
+                    uni3c_data_input = {"render_latent": uni3c_data["render_latent"][:, :, context_window]}
+                    for k in uni3c_data:
                         if k != "render_latent":
-                            pcd_data_input[k] = pcd_data[k]
+                            uni3c_data_input[k] = uni3c_data[k]
                 else:
-                    pcd_data_input = pcd_data
+                    uni3c_data_input = uni3c_data
 
                 if s2v_pose is not None:
                     if not ((s2v_pose_start_percent <= current_step_percentage <= s2v_pose_end_percent) or \
@@ -3043,7 +3039,7 @@ class WanVideoSampler:
                     'fun_camera': control_camera_input if control_camera_latents is not None else None, # Fun model camera embed
                     'audio_proj': audio_proj if fantasytalking_embeds is not None else None, # FantasyTalking audio projection
                     'audio_scale': audio_scale, # FantasyTalking audio scale
-                    "pcd_data": pcd_data_input, # Uni3C input
+                    "uni3c_data": uni3c_data_input, # Uni3C input
                     "controlnet": controlnet, # TheDenk's controlnet input
                     "add_cond": add_cond_input, # additional conditioning input
                     "nag_params": text_embeds.get("nag_params", {}), # normalized attention guidance
@@ -3070,6 +3066,8 @@ class WanVideoSampler:
                     "humo_audio_scale": humo_audio_scale if humo_audio is not None else 1,
                     "wananim_pose_latents": wananim_pose_latents.to(device) if wananim_pose_latents is not None else None, # WanAnimate pose latents
                     "wananim_face_pixel_values": wananim_face_pixels.to(device, torch.float32) if wananim_face_pixels is not None else None, # WanAnimate face images
+                    "wananim_pose_strength": wananim_pose_strength,
+                    "wananim_face_strength": wananim_face_strength
                 }
 
                 batch_size = 1
@@ -3100,6 +3098,8 @@ class WanVideoSampler:
                         #unconditional (negative) pass
                         base_params['is_uncond'] = True
                         base_params['clip_fea'] = clip_fea_neg if clip_fea_neg is not None else clip_fea
+                        if wananim_face_pixels is not None:
+                            base_params['wananim_face_pixel_values'] = torch.zeros_like(wananim_face_pixels).to(device, torch.float32) - 1
                         if humo_audio_input_neg is not None:
                             base_params['humo_audio'] = humo_audio_input_neg
                         if neg_latent is not None:
@@ -3720,10 +3720,10 @@ class WanVideoSampler:
                         audio_embs = None
                         cond_frame = None
                         
-                        pcd_data = pcd_data_input = None
+                        uni3c_data = uni3c_data_input = None
                         if uni3c_embeds is not None:
                             transformer.controlnet = uni3c_embeds["controlnet"]
-                            pcd_data = {
+                            uni3c_data = {
                                 "render_latent": uni3c_embeds["render_latent"],
                                 "render_mask": uni3c_embeds["render_mask"],
                                 "camera_embedding": uni3c_embeds["camera_embedding"],
@@ -3841,7 +3841,7 @@ class WanVideoSampler:
                                 else:
                                     cond_ = cond_image if is_first_clip else cond_frame
                                     latent_motion_frames = vae.encode(cond_.to(device, vae.dtype), device=device, tiled=tiled_vae, pbar=False).to(dtype)[0]
-                                vae.model.clear_cache()
+                                
                                 vae.to(offload_device)
 
                                 #motion_frame_index = cur_motion_frames_latent_num if mode == "infinitetalk" else 1
@@ -3898,7 +3898,7 @@ class WanVideoSampler:
                                 elif gguf_reader is not None: #handle GGUF
                                     load_weights(transformer, patcher.model["sd"], base_dtype=dtype, transformer_load_device=device, patcher=patcher, gguf=True, reader=gguf_reader, block_swap_args=block_swap_args)
                                 #blockswap init
-                                init_blockswap(transformer, block_swap_args, device, dtype)
+                                init_blockswap(transformer, block_swap_args, model)
 
                             # Use the appropriate prompt for this section
                             if len(text_embeds["prompt_embeds"]) > 1:
@@ -3940,9 +3940,9 @@ class WanVideoSampler:
                                     padded_images[:, :, audio_start_idx:audio_end_idx].to(device, vae.dtype),
                                     device=device, tiled=tiled_vae
                                 ).to(dtype)
-                                vae.model.clear_cache()
+                                
                                 vae.to(offload_device)
-                                pcd_data['render_latent'] = render_latent
+                                uni3c_data['render_latent'] = render_latent
 
                             # unianimate slices
                             partial_unianim_data = None
@@ -3984,7 +3984,8 @@ class WanVideoSampler:
                                     latent_model_input, cfg[min(i, len(timesteps)-1)], positive, text_embeds["negative_prompt_embeds"],
                                     timestep, i, y, clip_embeds, control_latents, window_vace_data, partial_unianim_data, audio_proj, control_camera_latents, add_cond,
                                     cache_state=self.cache_state, multitalk_audio_embeds=audio_embs, fantasy_portrait_input=partial_fantasy_portrait_input, 
-                                    humo_image_cond=partial_humo_cond_input, humo_image_cond_neg=partial_humo_cond_neg_input, humo_audio=partial_humo_audio, humo_audio_neg=partial_humo_audio_neg)
+                                    humo_image_cond=partial_humo_cond_input, humo_image_cond_neg=partial_humo_cond_neg_input, humo_audio=partial_humo_audio, humo_audio_neg=partial_humo_audio_neg,
+                                    uni3c_data = uni3c_data)
 
                                 if callback is not None:
                                     callback_latent = (latent_model_input.to(device) - noise_pred.to(device) * t.to(device) / 1000).detach().permute(1,0,2,3)
@@ -4028,7 +4029,7 @@ class WanVideoSampler:
                                 latent = latent[:,:-humo_reference_count]
                             vae.to(device)
                             videos = vae.decode(latent.unsqueeze(0).to(device, vae.dtype), device=device, tiled=tiled_vae, pbar=False)[0].cpu()
-                            vae.model.clear_cache()
+                            
                             vae.to(offload_device)
 
                             sampling_pbar.close()
@@ -4172,13 +4173,13 @@ class WanVideoSampler:
                         log.info(f"Sampling {total_frames} frames in {s2v_num_repeat} windows, at {latent.shape[3]*vae_upscale_factor}x{latent.shape[2]*vae_upscale_factor} with {steps} steps")
                         # sample
                         for r in range(s2v_num_repeat):
-                            vae.model.clear_cache()
+                            
                             mm.soft_empty_cache()
                             gc.collect()
                             if ref_motion_image is not None:
                                 vae.to(device)
                                 ref_motion = vae.encode(ref_motion_image.to(vae.dtype), device=device, pbar=False).to(dtype)[0]
-                                vae.model.clear_cache()
+                                
                                 vae.to(offload_device)
 
                             left_idx = r * infer_frames
@@ -4247,7 +4248,7 @@ class WanVideoSampler:
                             ref_motion_image = videos_last_frames
                             
                         vae.to(offload_device)
-                        vae.model.clear_cache()
+                        
                         mm.soft_empty_cache()
                         gen_video_samples = torch.cat(framepack_out, dim=2).squeeze(0).permute(1, 2, 3, 0)
 
@@ -4271,7 +4272,8 @@ class WanVideoSampler:
                         last_clip_num = (total_frames - overlap) % real_clip_len
                         extra = 0 if last_clip_num == 0 else real_clip_len - last_clip_num
                         target_len = total_frames + extra
-                        target_latent_len = (target_len - 1) // 4 + 2
+                        estimated_iterations = target_len // frame_window_size
+                        target_latent_len = (target_len - 1) // 4 + estimated_iterations
                         latent_window_size = (frame_window_size - 1) // 4 + 1
 
                         from .utils import tensor_pingpong_pad
@@ -4281,10 +4283,8 @@ class WanVideoSampler:
                         ref_masks = image_embeds.get("ref_masks", None)
                         bg_images = image_embeds.get("bg_images", None)
 
-                        pose_input_latents = current_ref_images = face_images = None
-                        #if wananim_pose_latents is not None:
-                            #pose_input_latents = tensor_pingpong_pad(wananim_pose_latents, target_latent_len)
-                            #log.info(f"WanAnimate: Pose input {wananim_pose_latents.shape} padded to shape {pose_input_latents.shape}")
+                        current_ref_images = face_images = None
+
                         if wananim_face_pixels is not None:
                             face_images = tensor_pingpong_pad(wananim_face_pixels, target_len)
                             log.info(f"WanAnimate: Face input {wananim_face_pixels.shape} padded to shape {face_images.shape}")
@@ -4294,11 +4294,6 @@ class WanVideoSampler:
                         if bg_images is not None:
                             bg_images_in = tensor_pingpong_pad(bg_images, target_len)
                             log.info(f"WanAnimate: BG images {bg_images.shape} padded to shape {bg_images.shape}")
-
-                        # if replace_flag:
-                        #     bg_images, mask_images = self.prepare_source_for_replace(src_bg_path, src_mask_path)
-                        #     bg_images = inputs_padding(bg_images, target_len)
-                        #     mask_images = inputs_padding(mask_images, target_len)
 
                         # init variables
                         offloaded = False
@@ -4312,7 +4307,7 @@ class WanVideoSampler:
                         end = frame_window_size
                         end_latent = latent_window_size
 
-                        estimated_iterations = target_len // frame_window_size
+                        
                         callback = prepare_callback(patcher, estimated_iterations)
                         log.info(f"Sampling {total_frames} frames in {estimated_iterations} windows, at {latent.shape[3]*vae_upscale_factor}x{latent.shape[2]*vae_upscale_factor} with {steps} steps")
                         
@@ -4329,18 +4324,12 @@ class WanVideoSampler:
                             self.cache_state = [None, None]
                           
                             if ref_latent is not None:
+                                if offload:
+                                    offload_transformer(transformer)
+                                    offloaded = True
                                 vae.to(device)
-                                #ref_latents = vae.encode([ref_images.to(device, vae.dtype)], device,tiled=tiled_vae)[0]
-                                #msk = torch.zeros(4, 1, lat_h, lat_w, device=device, dtype=dtype)
-                                #msk[:, :1] = 1
-                                #ref_latents = torch.cat([msk, ref_latents], dim=0) # 4+C 1 H W
                                 if ref_masks is not None:
                                     msk = ref_masks_in[:, start_latent:end_latent].to(device, dtype)
-                                    if msk.shape[1] < latent_window_size:
-                                        log.info(f"WanAnimate: Padding ref masks from {msk.shape} to length {latent_window_size}")
-                                        pad_length = latent_window_size - msk.shape[1]
-                                        last_frame = msk[:, -1:].repeat(1, pad_length, 1, 1)
-                                        msk = torch.cat([msk, last_frame], dim=1)
                                 else:
                                     msk = torch.zeros(4, latent_window_size, lat_h, lat_w, device=device, dtype=dtype)
                                 if bg_images is not None:
@@ -4354,11 +4343,20 @@ class WanVideoSampler:
                                     temporal_ref_latents = vae.encode([concatenated.to(device, vae.dtype)], device,tiled=tiled_vae)[0]
                                     msk[:, :mask_reft_len] = 1
 
-                                vae.model.clear_cache()
+                                if msk.shape[1] != temporal_ref_latents.shape[1]:
+                                    if temporal_ref_latents.shape[1] < msk.shape[1]:
+                                        pad_len = msk.shape[1] - temporal_ref_latents.shape[1]
+                                        pad_tensor = temporal_ref_latents[:, -1:].repeat(1, pad_len, 1, 1)
+                                        temporal_ref_latents = torch.cat([temporal_ref_latents, pad_tensor], dim=1)
+                                    else:
+                                        temporal_ref_latents = temporal_ref_latents[:, :msk.shape[1]]
+
+                                
                                 vae.to(offload_device)
                                 
                                 temporal_ref_latents = torch.cat([msk, temporal_ref_latents], dim=0) # 4+C T H W
-                                image_cond_in = torch.cat([ref_latent, temporal_ref_latents], dim=1) # 4+C T+trefs H W
+                                image_cond_in = torch.cat([ref_latent.to(device), temporal_ref_latents], dim=1) # 4+C T+trefs H W
+                                del temporal_ref_latents, msk, bg_image_slice
 
                             noise = torch.randn(16, latent_window_size + 1, lat_h, lat_w, dtype=torch.float32, device=torch.device("cpu"), generator=seed_g).to(device)
                             seq_len = math.ceil((noise.shape[2] * noise.shape[3]) / 4 * noise.shape[1])
@@ -4372,6 +4370,7 @@ class WanVideoSampler:
                                     pad_len = latent_window_size - pose_input_slice.shape[2]
                                     pad = torch.zeros(pose_input_slice.shape[0], pose_input_slice.shape[1], pad_len, pose_input_slice.shape[3], pose_input_slice.shape[4], device=pose_input_slice.device, dtype=pose_input_slice.dtype)
                                     pose_input_slice = torch.cat([pose_input_slice, pad], dim=2)
+                                    del pad
                                 pose_input_slice = pose_input_slice.to(device, dtype)
                             
                             if samples is not None:
@@ -4437,24 +4436,15 @@ class WanVideoSampler:
                                 positive = text_embeds["prompt_embeds"]
 
                             # uni3c slices
+                            uni3c_data_input = None
                             if uni3c_embeds is not None:
-                                vae.to(device)
-                                # Pad original_images if needed
-                                num_frames = original_images.shape[2]
-                                required_frames = audio_end_idx - audio_start_idx
-                                if audio_end_idx > num_frames:
-                                    pad_len = audio_end_idx - num_frames
-                                    last_frame = original_images[:, :, -1:].repeat(1, 1, pad_len, 1, 1)
-                                    padded_images = torch.cat([original_images, last_frame], dim=2)
-                                else:
-                                    padded_images = original_images
-                                render_latent = vae.encode(
-                                    padded_images[:, :, audio_start_idx:audio_end_idx].to(device, vae.dtype),
-                                    device=device, tiled=tiled_vae
-                                ).to(dtype)
-                                vae.model.clear_cache()
-                                vae.to(offload_device)
-                                pcd_data['render_latent'] = render_latent
+                                render_latent = uni3c_embeds["render_latent"][:,:,start_latent:end_latent].to(device)
+                                if render_latent.shape[2] < noise.shape[1]:
+                                    render_latent = torch.nn.functional.interpolate(render_latent, size=(noise.shape[1], noise.shape[2], noise.shape[3]), mode='trilinear', align_corners=False)
+                                uni3c_data_input = {"render_latent": render_latent}
+                                for k in uni3c_data:
+                                    if k != "render_latent":
+                                        uni3c_data_input[k] = uni3c_data[k]
                             
                             mm.soft_empty_cache()
                             gc.collect()
@@ -4469,7 +4459,7 @@ class WanVideoSampler:
                                     timestep, i, cache_state=self.cache_state, 
                                     image_cond = image_cond_in,
                                     wananim_face_pixels=face_images[:, :, start:end].to(device, torch.float32) if face_images is not None else None, 
-                                    wananim_pose_latents=pose_input_slice
+                                    wananim_pose_latents=pose_input_slice, uni3c_data = uni3c_data_input,
                                  )
                                 if callback is not None:
                                     callback_latent = (latent_model_input.to(device) - noise_pred.to(device) * t.to(device) / 1000).detach().permute(1,0,2,3)
@@ -4497,8 +4487,7 @@ class WanVideoSampler:
                             vae.to(device)
                             videos = vae.decode(latent[:, 1:].unsqueeze(0).to(device, vae.dtype), device=device, tiled=tiled_vae, pbar=False)[0].cpu()
                             del latent
-                            vae.model.clear_cache()
-                            vae.to(offload_device)
+                            
 
                             sampling_pbar.close()
                             
@@ -4542,6 +4531,7 @@ class WanVideoSampler:
                             gen_video_samples = torch.zeros(3, 1, 64, 64) # dummy output
 
                         if force_offload:
+                            vae.to(offload_device)
                             if not model["auto_cpu_offload"]:
                                 offload_transformer(transformer)
                         try:
@@ -4560,7 +4550,7 @@ class WanVideoSampler:
                             timestep, idx, image_cond, clip_fea, control_latents, vace_data, unianim_data, audio_proj, control_camera_latents, add_cond,
                             cache_state=self.cache_state, fantasy_portrait_input=fantasy_portrait_input, multitalk_audio_embeds=multitalk_audio_embeds, mtv_motion_tokens=mtv_motion_tokens, s2v_audio_input=s2v_audio_input,
                             humo_image_cond=humo_image_cond, humo_image_cond_neg=humo_image_cond_neg, humo_audio=humo_audio, humo_audio_neg=humo_audio_neg,
-                            wananim_face_pixels=wananim_face_pixels, wananim_pose_latents=wananim_pose_latents,
+                            wananim_face_pixels=wananim_face_pixels, wananim_pose_latents=wananim_pose_latents, uni3c_data = uni3c_data,
                         )
                         if bidirectional_sampling:
                             noise_pred_flipped, self.cache_state = predict_with_cfg(
@@ -4668,8 +4658,6 @@ class WanVideoSampler:
             latent = latent[:,:-phantom_latents.shape[1]]
         if humo_reference_count > 0:
             latent = latent[:,:-humo_reference_count]
-        if wananim_pose_latents is not None:
-            latent = latent[:, 1:]
         
         cache_states = None
         if cache_args is not None:
@@ -4776,7 +4764,7 @@ class WanVideoDecode:
             if end_image is not None:
                 enable_vae_tiling = False
             images = vae.decode(latents, device=device, end_=(end_image is not None), tiled=enable_vae_tiling, tile_size=(tile_x//8, tile_y//8), tile_stride=(tile_stride_x//8, tile_stride_y//8))[0]
-            vae.model.clear_cache()
+            
         
         images = images.cpu().float()
 
@@ -4796,7 +4784,7 @@ class WanVideoDecode:
         if end_image is not None: 
             images = images[:, 0:-1]
 
-        vae.model.clear_cache()
+        
         vae.to(offload_device)
         mm.soft_empty_cache()
 
@@ -4847,7 +4835,7 @@ class WanVideoEncodeLatentBatch:
                 latent = vae.encode(img.unsqueeze(0).unsqueeze(0).permute(0, 4, 1, 2, 3), device=device, tiled=enable_vae_tiling, tile_size=(tile_x//vae.upsampling_factor, tile_y//vae.upsampling_factor), tile_stride=(tile_stride_x//vae.upsampling_factor, tile_stride_y//vae.upsampling_factor))
             else:
                 latent = vae.encode(img.unsqueeze(0).unsqueeze(0).permute(0, 4, 1, 2, 3), device=device, tiled=enable_vae_tiling)
-            vae.model.clear_cache()
+            
             if latent_strength != 1.0:
                 latent *= latent_strength
             latent_list.append(latent.squeeze(0).cpu())
@@ -4907,7 +4895,7 @@ class WanVideoEncode:
             latents = latents.permute(0, 2, 1, 3, 4)
         else:
             latents = vae.encode(image * 2.0 - 1.0, device=device, tiled=enable_vae_tiling, tile_size=(tile_x//vae.upsampling_factor, tile_y//vae.upsampling_factor), tile_stride=(tile_stride_x//vae.upsampling_factor, tile_stride_y//vae.upsampling_factor))
-            vae.model.clear_cache()
+            
             vae.to(offload_device)
         if latent_strength != 1.0:
             latents *= latent_strength
