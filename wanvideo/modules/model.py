@@ -335,6 +335,29 @@ class WanRMSNorm(nn.Module):
             start_idx = end_idx
             
         return output
+    
+class WanFusedRMSNorm(nn.RMSNorm):
+    def forward(self, x, num_chunks=1):
+        use_chunked = num_chunks > 1
+        if use_chunked:
+            return self.forward_chunked(x, num_chunks)
+        else:
+            return super().forward(x)
+
+    def forward_chunked(self, x, num_chunks=4):
+        output = torch.empty_like(x)
+        
+        chunk_sizes = [x.shape[1] // num_chunks + (1 if i < x.shape[1] % num_chunks else 0) 
+                    for i in range(num_chunks)]
+        
+        start_idx = 0
+        for size in chunk_sizes:
+            end_idx = start_idx + size
+            chunk = x[:, start_idx:end_idx, :]
+            output[:, start_idx:end_idx, :] = super().forward(chunk)
+            start_idx = end_idx
+            
+        return output
 
 
 class WanLayerNorm(nn.LayerNorm):
@@ -383,9 +406,14 @@ class WanSelfAttention(nn.Module):
             self.k = nn.Linear(in_features, out_features)
             self.v = nn.Linear(in_features, out_features)
         self.o = nn.Linear(in_features, out_features)
-        self.norm_q = WanRMSNorm(out_features, eps=eps) if qk_norm else nn.Identity()
-        self.norm_k = WanRMSNorm(out_features, eps=eps) if qk_norm else nn.Identity()
-    
+
+        if False: # disable for now, seems to degrade quality
+            self.norm_q = WanFusedRMSNorm(out_features, eps=eps) if qk_norm else nn.Identity()
+            self.norm_k = WanFusedRMSNorm(out_features, eps=eps) if qk_norm else nn.Identity()
+        else:
+            self.norm_q = WanRMSNorm(out_features, eps=eps) if qk_norm else nn.Identity()
+            self.norm_k = WanRMSNorm(out_features, eps=eps) if qk_norm else nn.Identity()
+
     def qkv_fn(self, x):
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
         q = self.norm_q(self.q(x)).view(b, s, n, d)
@@ -810,6 +838,7 @@ class WanAttentionBlock(nn.Module):
                  rope_func="comfy",
                  use_motion_attn=False,
                  use_humo_audio_attn=False,
+                 face_fuser_block=False
                  ):
         super().__init__()
         self.dim = out_features
@@ -827,6 +856,7 @@ class WanAttentionBlock(nn.Module):
 
         self.kv_cache = None
         self.use_motion_attn = use_motion_attn
+        self.has_face_fuser_block = face_fuser_block
 
         # layers
         self.norm1 = WanLayerNorm(out_features, eps)
@@ -857,6 +887,10 @@ class WanAttentionBlock(nn.Module):
         # HuMo audio cross-attn
         if use_humo_audio_attn:
             self.audio_cross_attn_wrapper = AudioCrossAttentionWrapper(in_features, out_features, num_heads, qk_norm, eps, kv_dim=1536)
+
+        if face_fuser_block:
+            from .wananimate.face_blocks import FaceBlock
+            self.fuser_block = FaceBlock(self.dim, num_heads)
 
     #@torch.compiler.disable()
     def get_mod(self, e):
@@ -1633,7 +1667,8 @@ class WanModel(torch.nn.Module):
             self.blocks = nn.ModuleList([
                 WanAttentionBlock(cross_attn_type, self.in_features, self.out_features, ffn_dim, ffn2_dim, num_heads,
                                 qk_norm, cross_attn_norm, eps,
-                                attention_mode=self.attention_mode, rope_func=self.rope_func, use_motion_attn=(i % 4 == 0 and use_motion_attn), use_humo_audio_attn=self.humo_audio)
+                                attention_mode=self.attention_mode, rope_func=self.rope_func, use_motion_attn=(i % 4 == 0 and use_motion_attn), use_humo_audio_attn=self.humo_audio,
+                                face_fuser_block = i % 5 == 0 and is_wananimate)
                 for i in range(num_layers)
             ])
         #MTV Crafter
@@ -1724,14 +1759,10 @@ class WanModel(torch.nn.Module):
         self.motion_encoder = self.pose_patch_embedding = self.face_encoder = self.face_adapter = None
         if is_wananimate:
             from .wananimate.motion_encoder import MotionExtractor
-            from .wananimate.face_blocks import FaceEncoder, FaceAdapter
+            from .wananimate.face_blocks import FaceEncoder
             self.pose_patch_embedding = nn.Conv3d(16, dim, kernel_size=patch_size, stride=patch_size)
             self.motion_encoder = MotionExtractor()
-            self.face_adapter = FaceAdapter(
-                num_heads=self.num_heads,
-                feature_dim=self.dim,
-                num_adapter_layers=self.num_layers // 5,
-            )
+
             self.face_encoder = FaceEncoder(
                 in_dim=motion_encoder_dim,
                 out_dim=self.dim,
@@ -1903,12 +1934,10 @@ class WanModel(torch.nn.Module):
         return torch.cat([pad_face, motion_vec], dim=1)
 
 
-    def wananimate_forward(self, block_idx, x, motion_vec, strength=1.0, motion_masks=None):
-        if block_idx % 5 == 0:
+    def wananimate_forward(self, block, x, motion_vec, strength=1.0, motion_masks=None):
             adapter_args = [x, motion_vec, motion_masks]
-            residual_out = self.face_adapter.fuser_blocks[block_idx // 5](*adapter_args)
+            residual_out = block.fuser_block(*adapter_args)
             return x.add(residual_out, alpha=strength)
-        return x
 
 
     def rope_encode_comfy(self, t, h, w, freq_offset=0, t_start=0, attn_cond_shape=None, steps_t=None, steps_h=None, steps_w=None, ntk_alphas=[1,1,1], device=None, dtype=None):
@@ -2621,8 +2650,8 @@ class WanModel(torch.nn.Module):
                 x, x_ip = block(x, x_ip=x_ip, **kwargs) #run block
                 if self.audio_injector is not None and s2v_audio_input is not None:
                     x = self.audio_injector_forward(b, x, merged_audio_emb, scale=s2v_audio_scale) #s2v
-                if self.motion_encoder is not None and motion_vec is not None:
-                    x = self.wananimate_forward(b, x, motion_vec, strength=wananim_face_strength)
+                if block.has_face_fuser_block and motion_vec is not None:
+                    x = self.wananimate_forward(block, x, motion_vec, strength=wananim_face_strength)
                 if self.block_swap_debug:
                     compute_end = time.perf_counter()
                     compute_time = compute_end - compute_start
