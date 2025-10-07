@@ -10,6 +10,7 @@ from .wanvideo.modules.model import WanModel, LoRALinearLayer
 from .wanvideo.modules.t5 import T5EncoderModel
 from .wanvideo.modules.clip import CLIPModel
 from .wanvideo.wan_video_vae import WanVideoVAE, WanVideoVAE38
+from .custom_linear import _replace_linear
 
 from accelerate import init_empty_weights
 from .utils import set_module_tensor_to_device
@@ -531,6 +532,8 @@ class WanVideoLoraSelectMulti:
                 "low_mem_load": low_mem_load,
                 "merge_loras": merge_loras,
             })
+        if len(loras_list) == 0:
+            return None,
         return (loras_list,)
     
 class WanVideoVACEModelSelect:
@@ -549,9 +552,7 @@ class WanVideoVACEModelSelect:
     DESCRIPTION = "VACE model to use when not using model that has it included, loaded from 'ComfyUI/models/diffusion_models'"
 
     def getvacepath(self, vace_model):
-        vace_model = {
-            "path": folder_paths.get_full_path("diffusion_models", vace_model),
-        }
+        vace_model = [{"path": folder_paths.get_full_path("diffusion_models", vace_model)}]
         return (vace_model,)
     
 class WanVideoExtraModelSelect:
@@ -561,19 +562,24 @@ class WanVideoExtraModelSelect:
             "required": {
                 "extra_model": (folder_paths.get_filename_list("unet_gguf") + folder_paths.get_filename_list("diffusion_models"), {"tooltip": "These models are loaded from the 'ComfyUI/models/diffusion_models' path to extra state dict to add to the main model"}),
             },
+            "optional": {
+                "prev_model":("VACEPATH", {"default": None, "tooltip": "For loading multiple extra models"}),
+            },
         }
 
     RETURN_TYPES = ("VACEPATH",)
     RETURN_NAMES = ("extra_model", )
-    FUNCTION = "getvacepath"
+    FUNCTION = "getmodelpath"
     CATEGORY = "WanVideoWrapper"
     DESCRIPTION = "Extra model to load and add to the main model, ie. VACE or MTV Crafter 'ComfyUI/models/diffusion_models'"
 
-    def getvacepath(self, extra_model):
-        extra_model = {
-            "path": folder_paths.get_full_path("diffusion_models", extra_model),
-        }
-        return (extra_model,)
+    def getmodelpath(self, extra_model, prev_model=None):
+        extra_model = {"path": folder_paths.get_full_path("diffusion_models", extra_model)}
+        if prev_model is not None and isinstance(prev_model, list):
+            extra_model_list = prev_model + [extra_model]
+        else:
+            extra_model_list = [extra_model]
+        return (extra_model_list,)
 
 class WanVideoLoraBlockEdit:
     def __init__(self):
@@ -855,12 +861,18 @@ def load_weights(transformer, sd=None, weight_dtype=None, base_dtype=None,
         # GGUF: skip GGUFParameter params
         if gguf and isinstance(param, GGUFParameter):
             continue
+        
+        key = name.replace("_orig_mod.", "")
+        value=sd[key]
 
         if gguf:
             dtype_to_use = torch.float32 if "patch_embedding" in name or "motion_encoder" in name else base_dtype
         else:
             dtype_to_use = base_dtype if any(keyword in name for keyword in params_to_keep) else weight_dtype
-            dtype_to_use = weight_dtype if sd[name.replace("_orig_mod.", "")].dtype == weight_dtype else dtype_to_use
+            dtype_to_use = weight_dtype if value.dtype == weight_dtype else dtype_to_use
+            scale_key = key.replace(".weight", ".scale_weight")
+            if scale_key in sd:
+                dtype_to_use = value.dtype
             if "modulation" in name or "norm" in name or "bias" in name or "img_emb" in name:
                 dtype_to_use = base_dtype
             if "patch_embedding" in name or "motion_encoder" in name:
@@ -876,7 +888,7 @@ def load_weights(transformer, sd=None, weight_dtype=None, base_dtype=None,
                 if vace_block_idx >= len(transformer.vace_blocks) - block_swap_args.get("vace_blocks_to_swap", 0):
                     load_device = offload_device
         # Set tensor to device
-        set_module_tensor_to_device(transformer, name, device=load_device, dtype=dtype_to_use, value=sd[name.replace("_orig_mod.", "")])
+        set_module_tensor_to_device(transformer, name, device=load_device, dtype=dtype_to_use, value=value)
         cnt += 1
         if cnt % 100 == 0:
             pbar.update(100)
@@ -1102,18 +1114,20 @@ class WanVideoModelLoader:
 
         # currently this can be VAE or MTV-Crafter weights
         if extra_model is not None:
-            if gguf:
-                if not extra_model["path"].endswith(".gguf"):
-                    raise ValueError("With GGUF main model the extra model must also be GGUF quantized, if the main model already has VACE included, you can disconnect the extra module loader")
-                extra_sd, extra_reader = load_gguf(extra_model["path"])
-                gguf_reader.append(extra_reader)
-                del extra_reader
-            else:
-                if extra_model["path"].endswith(".gguf"):
-                    raise ValueError("With GGUF extra model the main model must also be GGUF quantized model")
-                extra_sd = load_torch_file(extra_model["path"], device=transformer_load_device, safe_load=True)
-            sd.update(extra_sd)
-            del extra_sd
+            for _model in extra_model:
+                print("Loading extra model: ", _model["path"])
+                if gguf:
+                    if not _model["path"].endswith(".gguf"):
+                        raise ValueError("With GGUF main model the extra model must also be GGUF quantized, if the main model already has VACE included, you can disconnect the extra module loader")
+                    extra_sd, extra_reader = load_gguf(_model["path"])
+                    gguf_reader.append(extra_reader)
+                    del extra_reader
+                else:
+                    if _model["path"].endswith(".gguf"):
+                        raise ValueError("With GGUF extra model the main model must also be GGUF quantized model")
+                    extra_sd = load_torch_file(_model["path"], device=transformer_load_device, safe_load=True)
+                sd.update(extra_sd)
+                del extra_sd
 
         first_key = next(iter(sd))
         if first_key.startswith("model.diffusion_model."):
@@ -1140,6 +1154,18 @@ class WanVideoModelLoader:
 
         is_humo = "audio_proj.audio_proj_glob_1.layer.weight" in sd
         is_wananimate = "pose_patch_embedding.weight" in sd
+
+        #lynx
+        lynx_ip_layers = lynx_ref_layers = None
+        if "blocks.0.self_attn.ref_adapter.to_k_ref.weight" in sd:
+            log.info("Lynx full reference adapter detected")
+            lynx_ref_layers = "full"
+        if "blocks.0.cross_attn.ip_adapter.registers" in sd:
+            log.info("Lynx full IP adapter detected")
+            lynx_ip_layers = "full"
+        elif "blocks.0.cross_attn.ip_adapter.to_v_ip.weight" in sd:
+            log.info("Lynx lite IP adapter detected")
+            lynx_ip_layers = "lite"
 
         model_type = "t2v"
         if "audio_injector.injector.0.k.weight" in sd:
@@ -1201,6 +1227,15 @@ class WanVideoModelLoader:
                 "e": [-114.36346466, 65.26524496, -18.82220707, 4.91518089, -0.23412683],
                 "e0": [8.10705460e+03, 2.13393892e+03, -3.72934672e+02, 1.66203073e+01, -4.17769401e-02],
             },
+            # Placeholders until TeaCache for Wan2.2 is obtained
+            "14B_2.2": {
+                "e": [-5784.54975374, 5449.50911966, -1811.16591783, 256.27178429, -13.02252404],
+                "e0": [-3.03318725e+05, 4.90537029e+04, -2.65530556e+03, 5.87365115e+01, -3.15583525e-01],
+            },
+            "i2v_14B_2.2":{
+                "e": [-114.36346466, 65.26524496, -18.82220707, 4.91518089, -0.23412683],
+                "e0": [8.10705460e+03, 2.13393892e+03, -3.72934672e+02, 1.66203073e+01, -4.17769401e-02],
+            },
         }
 
         magcache_ratios_map = {
@@ -1208,6 +1243,8 @@ class WanVideoModelLoader:
             "14B": np.array([1.0]*2+[1.02504, 1.03017, 1.00025, 1.00251, 0.9985, 0.99962, 0.99779, 0.99771, 0.9966, 0.99658, 0.99482, 0.99476, 0.99467, 0.99451, 0.99664, 0.99656, 0.99434, 0.99431, 0.99533, 0.99545, 0.99468, 0.99465, 0.99438, 0.99434, 0.99516, 0.99517, 0.99384, 0.9938, 0.99404, 0.99401, 0.99517, 0.99516, 0.99409, 0.99408, 0.99428, 0.99426, 0.99347, 0.99343, 0.99418, 0.99416, 0.99271, 0.99269, 0.99313, 0.99311, 0.99215, 0.99215, 0.99218, 0.99215, 0.99216, 0.99217, 0.99163, 0.99161, 0.99138, 0.99135, 0.98982, 0.9898, 0.98996, 0.98995, 0.9887, 0.98866, 0.98772, 0.9877, 0.98767, 0.98765, 0.98573, 0.9857, 0.98501, 0.98498, 0.9838, 0.98376, 0.98177, 0.98173, 0.98037, 0.98035, 0.97678, 0.97677, 0.97546, 0.97543, 0.97184, 0.97183, 0.96711, 0.96708, 0.96349, 0.96345, 0.95629, 0.95625, 0.94926, 0.94929, 0.93964, 0.93961, 0.92511, 0.92504, 0.90693, 0.90678, 0.8796, 0.87945, 0.86111, 0.86189]),
             "i2v_480": np.array([1.0]*2+[0.98783, 0.98993, 0.97559, 0.97593, 0.98311, 0.98319, 0.98202, 0.98225, 0.9888, 0.98878, 0.98762, 0.98759, 0.98957, 0.98971, 0.99052, 0.99043, 0.99383, 0.99384, 0.98857, 0.9886, 0.99065, 0.99068, 0.98845, 0.98847, 0.99057, 0.99057, 0.98957, 0.98961, 0.98601, 0.9861, 0.98823, 0.98823, 0.98756, 0.98759, 0.98808, 0.98814, 0.98721, 0.98724, 0.98571, 0.98572, 0.98543, 0.98544, 0.98157, 0.98165, 0.98411, 0.98413, 0.97952, 0.97953, 0.98149, 0.9815, 0.9774, 0.97742, 0.97825, 0.97826, 0.97355, 0.97361, 0.97085, 0.97087, 0.97056, 0.97055, 0.96588, 0.96587, 0.96113, 0.96124, 0.9567, 0.95681, 0.94961, 0.94969, 0.93973, 0.93988, 0.93217, 0.93224, 0.91878, 0.91896, 0.90955, 0.90954, 0.92617, 0.92616]),
             "i2v_720": np.array([1.0]*2+[0.99428, 0.99498, 0.98588, 0.98621, 0.98273, 0.98281, 0.99018, 0.99023, 0.98911, 0.98917, 0.98646, 0.98652, 0.99454, 0.99456, 0.9891, 0.98909, 0.99124, 0.99127, 0.99102, 0.99103, 0.99215, 0.99212, 0.99515, 0.99515, 0.99576, 0.99572, 0.99068, 0.99072, 0.99097, 0.99097, 0.99166, 0.99169, 0.99041, 0.99042, 0.99201, 0.99198, 0.99101, 0.99101, 0.98599, 0.98603, 0.98845, 0.98844, 0.98848, 0.98851, 0.98862, 0.98857, 0.98718, 0.98719, 0.98497, 0.98497, 0.98264, 0.98263, 0.98389, 0.98393, 0.97938, 0.9794, 0.97535, 0.97536, 0.97498, 0.97499, 0.973, 0.97301, 0.96827, 0.96828, 0.96261, 0.96263, 0.95335, 0.9534, 0.94649, 0.94655, 0.93397, 0.93414, 0.91636, 0.9165, 0.89088, 0.89109, 0.8679, 0.86768]),
+            "14B_2.2": np.array([1.0]*2+[0.99505, 0.99389, 0.99441, 0.9957, 0.99558, 0.99551, 0.99499, 0.9945, 0.99534, 0.99548, 0.99468, 0.9946, 0.99463, 0.99458, 0.9946, 0.99453, 0.99408, 0.99404, 0.9945, 0.99441, 0.99409, 0.99398, 0.99403, 0.99397, 0.99382, 0.99377, 0.99349, 0.99343, 0.99377, 0.99378, 0.9933, 0.99328, 0.99303, 0.99301, 0.99217, 0.99216, 0.992, 0.99201, 0.99201, 0.99202, 0.99133, 0.99132, 0.99112, 0.9911, 0.99155, 0.99155, 0.98958, 0.98957, 0.98959, 0.98958, 0.98838, 0.98835, 0.98826, 0.98825, 0.9883, 0.98828, 0.98711, 0.98709, 0.98562, 0.98561, 0.98511, 0.9851, 0.98414, 0.98412, 0.98284, 0.98282, 0.98104, 0.98101, 0.97981, 0.97979, 0.97849, 0.97849, 0.97557, 0.97554, 0.97398, 0.97395, 0.97171, 0.97166, 0.96917, 0.96913, 0.96511, 0.96507, 0.96263, 0.96257, 0.95839, 0.95835, 0.95483, 0.95475, 0.94942, 0.94936, 0.9468, 0.94678, 0.94583, 0.94594, 0.94843, 0.94872, 0.96949, 0.97015]),
+            "i2v_14B_2.2": np.array([1.0]*2+[0.99512, 0.99559, 0.99559, 0.99561, 0.99595, 0.99577, 0.99512, 0.99512, 0.99546, 0.99534, 0.99543, 0.99531, 0.99496, 0.99491, 0.99504, 0.99499, 0.99444, 0.99449, 0.99481, 0.99481, 0.99435, 0.99435, 0.9943, 0.99431, 0.99411, 0.99406, 0.99373, 0.99376, 0.99413, 0.99405, 0.99363, 0.99359, 0.99335, 0.99331, 0.99244, 0.99243, 0.99229, 0.99229, 0.99239, 0.99236, 0.99163, 0.9916, 0.99149, 0.99151, 0.99191, 0.99192, 0.9898, 0.98981, 0.9899, 0.98987, 0.98849, 0.98849, 0.98846, 0.98846, 0.98861, 0.98861, 0.9874, 0.98738, 0.98588, 0.98589, 0.98539, 0.98534, 0.98444, 0.98439, 0.9831, 0.98309, 0.98119, 0.98118, 0.98001, 0.98, 0.97862, 0.97859, 0.97555, 0.97558, 0.97392, 0.97388, 0.97152, 0.97145, 0.96871, 0.9687, 0.96435, 0.96434, 0.96129, 0.96127, 0.95639, 0.95638, 0.95176, 0.95175, 0.94446, 0.94452, 0.93972, 0.93974, 0.93575, 0.9359, 0.93537, 0.93552, 0.96655, 0.96616]),
         }
 
         model_variant = "14B" #default to this
@@ -1223,6 +1260,13 @@ class WanVideoModelLoader:
             model_variant = "1_3B"
         if dim == 3072:
             log.info(f"5B model detected, no Teacache or MagCache coefficients available, consider using EasyCache for this model")
+        
+        if "high" in model.lower() or "low" in model.lower():
+            if "i2v" in model.lower():
+                model_variant = "i2v_14B_2.2"
+            else:
+                model_variant = "14B_2.2"
+        
         log.info(f"Model variant detected: {model_variant}")
         
         TRANSFORMER_CONFIG= {
@@ -1259,6 +1303,8 @@ class WanVideoModelLoader:
             "humo_audio": is_humo,
             "is_wananimate": is_wananimate,
             "rms_norm_function": rms_norm_function,
+            "lynx_ip_layers": lynx_ip_layers,
+            "lynx_ref_layers": lynx_ref_layers,
 
         }
 
@@ -1399,7 +1445,7 @@ class WanVideoModelLoader:
                 del unianimate_sd
       
         if not gguf:
-            if merge_loras and lora is not None:
+            if lora is not None and merge_loras:
                 if not lora_low_mem_load:
                     load_weights(transformer, sd, weight_dtype, base_dtype, transformer_load_device)
                 
@@ -1416,8 +1462,7 @@ class WanVideoModelLoader:
                     patcher.patches.clear()
                 transformer.patched_linear = False
                 sd = None
-            else:
-                from .custom_linear import _replace_linear
+            elif "scaled" in quantization or lora is not None:
                 transformer = _replace_linear(transformer, base_dtype, sd, scale_weights=scale_weights)
                 transformer.patched_linear = True
 
