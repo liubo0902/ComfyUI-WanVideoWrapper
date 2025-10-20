@@ -3,6 +3,7 @@ import torch
 from einops import rearrange
 import torch.nn.functional as F
 from ..attention import attention
+from dist_utils import all_all_async, args, tensor_chunk, all_gather, all_all, has_nvlink, all_gather_async
 
 class CausalConv1d(nn.Module):
     def __init__(self, chan_in, chan_out, kernel_size=3, stride=1, dilation=1, pad_mode="replicate", **kwargs):
@@ -118,11 +119,22 @@ class FaceBlock(nn.Module):
 
         k = rearrange(k, "B L N H D -> (B L) N H D")
         v = rearrange(v, "B L N H D -> (B L) N H D")
+        if args.world_size > 1:
+            q = all_gather(None, q, 1)
         q = rearrange(q, "B (L S) H D -> (B L) S H D", L=T)
+
+        if args.world_size > 1:
+            q = tensor_chunk(q, dim=0)[args.rank]
+            k = tensor_chunk(k, dim=0)[args.rank]
+            v = tensor_chunk(v, dim=0)[args.rank]
 
         attn = attention(q, k, v)
         attn = attn.reshape(attn.shape[0], attn.shape[1], -1)
+        if args.world_size > 1:
+            attn = all_gather(None, attn, 0)
         attn = rearrange(attn, "(B L) S C -> B (L S) C", L=T)
+        if args.world_size > 1:
+            attn = tensor_chunk(attn, dim=1)[args.rank]
         output = self.linear2(attn)
 
         if motion_mask is not None:

@@ -328,6 +328,8 @@ class SingleStreamMultiAttention(SingleStreamAttention):
             return super().forward(x, encoder_hidden_states, shape)
 
         N_t, N_h, N_w = shape
+        if args.world_size > 1:
+            x = all_gather(None, x, dim=1)
         
         x_extra = None
         if x.shape[0] * N_t != encoder_hidden_states.shape[0]:
@@ -431,16 +433,24 @@ class SingleStreamMultiAttention(SingleStreamAttention):
         q = rearrange(q, "B H M K -> B M H K")
         encoder_k = rearrange(encoder_k, "B H M K -> B M H K")
         encoder_v = rearrange(encoder_v, "B H M K -> B M H K")
+        if args.world_size > 1:
+            q = tensor_chunk(q, dim=0)
+            encoder_k = tensor_chunk(encoder_k, dim=0)
+            encoder_v = tensor_chunk(encoder_v, dim=0)
         x = attention(
             q, encoder_k, encoder_v, attention_mode=self.attention_mode
         )
 
         # Linear projection
-        x = x.reshape(B, N, C)
+        x = x.reshape(-1, N, C)
         x = self.proj(x)
+        if args.world_size > 1:
+            x = all_gather(None, x, dim=0)
 
         # Restore original layout
         x = rearrange(x, "(B N_t) S C -> B (N_t S) C", N_t=N_t)
+        if args.world_size > 1:
+            x = tensor_chunk(x)[args.rank]
         if x_extra is not None:
             x = torch.cat([x, torch.zeros_like(x_extra)], dim=1)
 

@@ -1992,6 +1992,8 @@ class WanModel(torch.nn.Module):
             torch.cat([u, u.new_zeros(1, seq_len - u.size(1), u.size(2))],
                       dim=1) for u in c
         ])
+        if args.world_size > 1:
+            c = tensor_chunk(c, dim=1)[args.rank]
 
         if x.shape[1] > c.shape[1]:
             c = torch.cat([c.new_zeros(x.shape[0], x.shape[1] - c.shape[1], c.shape[2]), c], dim=1)
@@ -2083,9 +2085,9 @@ class WanModel(torch.nn.Module):
 
 
     def wananimate_forward(self, block, x, motion_vec, strength=1.0, motion_masks=None):
-            adapter_args = [x, motion_vec, motion_masks]
-            residual_out = block.fuser_block(*adapter_args)
-            return x.add(residual_out, alpha=strength)
+        adapter_args = [x, motion_vec, motion_masks]
+        residual_out = block.fuser_block(*adapter_args)
+        return x.add(residual_out, alpha=strength)
 
 
     def rope_encode_comfy(self, t, h, w, freq_offset=0, t_start=0, attn_cond_shape=None, steps_t=None, steps_h=None, steps_w=None, ntk_alphas=[1,1,1], device=None, dtype=None):
@@ -2765,6 +2767,12 @@ class WanModel(torch.nn.Module):
                 lynx_ip_scale=lynx_ip_scale,
                 lynx_ref_scale=lynx_ref_scale,
             )
+            dist_seq_lens = []
+            if args.world_size > 1:
+                x_lists = tensor_chunk(x, dim=1)
+                dist_seq_lens = [_.size(1) for _ in x_lists]
+                x = x_lists[args.rank]
+            kwargs['dist_seq_lens'] = dist_seq_lens
             if self.audio_model is not None:
                 kwargs['e_ovi'] = e0_ovi.to(self.base_dtype)
                 kwargs['context_ovi'] = context_ovi
@@ -2820,13 +2828,6 @@ class WanModel(torch.nn.Module):
             # lynx ref
             if lynx_ref_buffer is None and lynx_ref_feature_extractor:
                 lynx_ref_buffer = {}
-            
-            dist_seq_lens = []
-            if args.world_size > 1:
-                x_lists = tensor_chunk(x, dim=1)
-                dist_seq_lens = [_.size(1) for _ in x_lists]
-                x = x_lists[args.rank]
-            kwargs['dist_seq_lens'] = dist_seq_lens
 
             for b, block in enumerate(self.blocks):
                 mm.throw_exception_if_processing_interrupted()
