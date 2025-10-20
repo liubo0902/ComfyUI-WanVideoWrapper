@@ -2,6 +2,7 @@ from einops import rearrange, repeat
 import torch
 import torch.nn as nn
 from ..wanvideo.modules.attention import attention
+from dist_utils import all_all_async, args, tensor_chunk, all_gather, all_all, has_nvlink, all_gather_async
 
 def timestep_transform(
     t,
@@ -239,20 +240,30 @@ class SingleStreamAttention(nn.Module):
 
         B = x.shape[0]
         S = N_h * N_w
-        x = x.view(B * N_t, S, self.dim)
+        if args.world_size > 1:
+            x = all_gather(None, x, dim=1)
+        bs = B * N_t
+        x = x.view(bs, S, self.dim)
+        if args.world_size > 1:
+            x = tensor_chunk(x, dim=0)[args.rank]
+            encoder_hidden_states = tensor_chunk(encoder_hidden_states, dim=0)[args.rank]
 
         # get q for hidden_state
-        q = self.q_linear(x).view(B * N_t, S, self.num_heads, self.head_dim)
+        q = self.q_linear(x).view(bs, S, self.num_heads, self.head_dim)
         
         # get kv from encoder_hidden_states # shape: (B, N, num_heads, head_dim)
         kv = self.kv_linear(encoder_hidden_states)
-        encoder_k, encoder_v = kv.view(B * N_t, encoder_hidden_states.shape[1], 2, self.num_heads, self.head_dim).unbind(2)
+        encoder_k, encoder_v = kv.view(bs, encoder_hidden_states.shape[1], 2, self.num_heads, self.head_dim).unbind(2)
 
         x = attention(q, encoder_k, encoder_v, attention_mode=self.attention_mode)
 
         # linear transform
-        x = self.proj(x.reshape(B * N_t, S, self.dim))
+        x = self.proj(x.reshape(bs, S, self.dim))
+        if args.world_size > 1:
+            x = all_gather(None, x, dim=0)
         x = x.view(B, N_t * S, self.dim)
+        if args.world_size > 1:
+            x = tensor_chunk(x, dim=1)[args.rank]
     
         if x_extra is not None:
             x = torch.cat([x, torch.zeros_like(x_extra)], dim=1)
