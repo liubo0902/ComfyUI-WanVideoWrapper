@@ -229,6 +229,9 @@ class SingleStreamAttention(nn.Module):
     def forward(self, x: torch.Tensor, encoder_hidden_states: torch.Tensor, shape=None) -> torch.Tensor:
         N_t, N_h, N_w = shape
 
+        if args.world_size > 1:
+            x = all_gather(None, x, dim=1)
+
         expected_tokens = N_t * N_h * N_w
         actual_tokens = x.shape[1]
         x_extra = None
@@ -240,13 +243,12 @@ class SingleStreamAttention(nn.Module):
 
         B = x.shape[0]
         S = N_h * N_w
-        if args.world_size > 1:
-            x = all_gather(None, x, dim=1)
         bs = B * N_t
         x = x.view(bs, S, self.dim)
         if args.world_size > 1:
             x = tensor_chunk(x, dim=0)[args.rank]
             encoder_hidden_states = tensor_chunk(encoder_hidden_states, dim=0)[args.rank]
+            bs = x.size(0)
 
         # get q for hidden_state
         q = self.q_linear(x).view(bs, S, self.num_heads, self.head_dim)
