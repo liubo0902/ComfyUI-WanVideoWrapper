@@ -1017,9 +1017,9 @@ class WanVideoAnimateEmbeds:
 
     def process(self, vae, width, height, num_frames, force_offload, frame_window_size, colormatch, pose_strength, face_strength,
                 ref_images=None, pose_images=None, face_images=None, clip_embeds=None, tiled_vae=False, bg_images=None, mask=None):
-
-        H = height
-        W = width
+        
+        W = (width // 16) * 16
+        H = (height // 16) * 16
 
         lat_h = H // vae.upsampling_factor
         lat_w = W // vae.upsampling_factor
@@ -1044,7 +1044,7 @@ class WanVideoAnimateEmbeds:
         gc.collect()
         vae.to(device)
         # Resize and rearrange the input image dimensions
-        pose_latents = ref_latents = ref_latent = None
+        pose_latents = ref_latent = None
         if pose_images is not None:
             pose_images = pose_images[..., :3]
             if pose_images.shape[1] != H or pose_images.shape[2] != W:
@@ -1997,6 +1997,8 @@ class WanVideoDecode:
         drop_last = samples.get("drop_last", False)
         is_looped = samples.get("looped", False)
 
+        flashvsr_LQ_images = samples.get("flashvsr_LQ_images", None)
+
         vae.to(device)
 
         latents = latents.to(device = device, dtype = vae.dtype)
@@ -2009,7 +2011,7 @@ class WanVideoDecode:
             latents = latents[:, :, :-1]
 
         if type(vae).__name__ == "TAEHV":      
-            images = vae.decode_video(latents.permute(0, 2, 1, 3, 4))[0].permute(1, 0, 2, 3)
+            images = vae.decode_video(latents.permute(0, 2, 1, 3, 4), cond=flashvsr_LQ_images.to(vae.dtype) if flashvsr_LQ_images is not None else None)[0].permute(1, 0, 2, 3)
             images = torch.clamp(images, 0.0, 1.0)
             images = images.permute(1, 2, 3, 0).cpu().float()
             return (images,)
