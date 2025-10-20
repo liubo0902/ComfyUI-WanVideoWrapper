@@ -23,6 +23,7 @@ from ...multitalk.multitalk import get_attn_map_with_target
 from ...echoshot.echoshot import rope_apply_z, rope_apply_c, rope_apply_echoshot
 
 from ...MTV.mtv import apply_rotary_emb
+from dist_utils import all_all_async, args, tensor_chunk, all_gather, all_all, has_nvlink, all_gather_async
 
 class FramePackMotioner(nn.Module):#from comfy.ldm.wan.model
     def __init__(
@@ -484,7 +485,10 @@ class WanSelfAttention(nn.Module):
             x = x.add(ref_x, alpha=lynx_ref_scale)
 
         # output
-        return self.o(x.flatten(2))
+        x = x.flatten(2)
+        if args.world_size > 1:
+            x = all_all(x, 1, 2)
+        return self.o(x)
     
     def forward_ip(self, q, k, v, q_ip, k_ip, v_ip, seq_lens, attention_mode_override=None):
         attention_mode = self.attention_mode
@@ -507,7 +511,10 @@ class WanSelfAttention(nn.Module):
             x = RadialSpargeSageAttnDense(q, k, v, self.mask_map)
         else:
             x = RadialSpargeSageAttn(q, k, v, self.mask_map, decay_factor=self.decay_factor)
-        return self.o(x.flatten(2))
+        x = x.flatten(2)
+        if args.world_size > 1:
+            x = all_all(x, 1, 2)
+        return self.o(x)
     
     
     def forward_multitalk(self, q, k, v, seq_lens, grid_sizes, ref_target_masks):
@@ -519,6 +526,8 @@ class WanSelfAttention(nn.Module):
 
         # output
         x = x.flatten(2)
+        if args.world_size > 1:
+            x = all_all(x, 1, 2)
         x = self.o(x)
 
         x_ref_attn_map = get_attn_map_with_target(q.type_as(x), k.type_as(x), grid_sizes[0], ref_target_masks=ref_target_masks)
@@ -1028,7 +1037,8 @@ class WanAttentionBlock(nn.Module):
         mtv_motion_tokens=None, mtv_motion_rotary_emb=None, mtv_strength=1.0, mtv_freqs=None, #mtv crafter
         humo_audio_input=None, humo_audio_scale=1.0, #humo audio
         lynx_x_ip=None, lynx_ref_feature=None, lynx_ip_scale=1.0, lynx_ref_scale=1.0, #lynx
-        x_ovi=None, e_ovi=None, freqs_ovi=None, context_ovi=None, seq_lens_ovi=None, grid_sizes_ovi=None #ovi
+        x_ovi=None, e_ovi=None, freqs_ovi=None, context_ovi=None, seq_lens_ovi=None, grid_sizes_ovi=None, #ovi
+        dist_seq_lens=[],
     ):
         r"""
         Args:
@@ -1068,6 +1078,8 @@ class WanAttentionBlock(nn.Module):
             camera_embed = camera_embed.repeat(1, 2, 1)
             camera_embed = camera_embed.unsqueeze(2).unsqueeze(3).repeat(1, 1, grid_sizes[0][1], grid_sizes[0][2], 1)
             camera_embed = rearrange(camera_embed, 'b f h w d -> b (f h w) d')
+            if args.world_size > 1:
+                camera_embed = tensor_chunk(camera_embed, dim=1)[args.rank]
             input_x += camera_embed
 
         # self-attention
@@ -1080,6 +1092,10 @@ class WanAttentionBlock(nn.Module):
         if inner_t is not None:
             #query, key, value
             q, k, v = self.self_attn.qkv_fn(input_x)
+            if args.world_size > 1:
+                q = all_all(q, 2, 1)
+                k = all_all(k, 2, 1)
+                v = all_all(v, 2, 1)
             q=rope_apply_echoshot(q, grid_sizes, freqs, inner_t).to(q)
             k=rope_apply_echoshot(k, grid_sizes, freqs, inner_t).to(k)
         elif x_ip is not None and self.kv_cache is None:
@@ -1099,6 +1115,10 @@ class WanAttentionBlock(nn.Module):
                 q_ip, k_ip = apply_rope_comfy_chunked(q_ip, k_ip, freqs_ip)
         else:
             q, k, v = self.self_attn.qkv_fn(input_x)
+            if args.world_size > 1:
+                q = all_all(q, 2, 1)
+                k = all_all(k, 2, 1)
+                v = all_all(v, 2, 1)
             if self.rope_func == "comfy":
                 q, k = apply_rope_comfy(q, k, freqs)
             elif self.rope_func == "comfy_chunked":
@@ -2800,6 +2820,13 @@ class WanModel(torch.nn.Module):
             # lynx ref
             if lynx_ref_buffer is None and lynx_ref_feature_extractor:
                 lynx_ref_buffer = {}
+            
+            dist_seq_lens = []
+            if args.world_size > 1:
+                x_lists = tensor_chunk(x, dim=1)
+                dist_seq_lens = [_.size(1) for _ in x_lists]
+                x = x_lists[args.rank]
+            kwargs['dist_seq_lens'] = dist_seq_lens
 
             for b, block in enumerate(self.blocks):
                 mm.throw_exception_if_processing_interrupted()
@@ -2864,6 +2891,9 @@ class WanModel(torch.nn.Module):
                 #controlnet
                 if (controlnet is not None) and (b % controlnet["controlnet_stride"] == 0) and (b // controlnet["controlnet_stride"] < len(controlnet["controlnet_states"])):
                     x[:, :self.original_seq_len] += controlnet["controlnet_states"][b // controlnet["controlnet_stride"]].to(x) * controlnet["controlnet_weight"]
+
+            if args.world_size > 1:
+                x = all_gather(None, x, dim=1)
 
             if lynx_ref_feature_extractor:
                 return lynx_ref_buffer
