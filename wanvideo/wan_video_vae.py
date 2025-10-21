@@ -5,8 +5,32 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
 from comfy.utils import ProgressBar
+from dist_utils import args, tensor_chunk, all_gather, all_all, all_all_async, conv3d_p2pop, conv2d_p2pop, tensor_boradcast, tensor_chunk_send
 
 CACHE_T = 2
+
+class DistConv2d(torch.nn.Conv2d):
+    def __init__(self, inchannel, out_channel, ksize, pad_size, padding=(0, 1), stride=(1, 1)):
+        super().__init__(inchannel, out_channel, ksize, padding=padding, stride=stride)
+        self.pad_size = pad_size
+    def reset_parameters(self):
+        return None
+
+    def forward(self, x, *args, **kwargs):
+        x = F.pad(x, [0, 0, self.pad_size, self.pad_size])
+        x = conv2d_p2pop(x, self.pad_size)
+        return super().forward(x, *args, **kwargs)
+        
+class DistDownConv2d(torch.nn.Conv2d):
+    def __init__(self, inchannel, out_channel, ksize, pad_size, padding=(0, 1), stride=(1, 1)):
+        super().__init__(inchannel, out_channel, ksize, padding=padding, stride=stride)
+        self.pad_size = pad_size
+    def reset_parameters(self):
+        return None
+
+    def forward(self, x, *args, **kwargs):
+        x = conv2d_p2pop(x, self.pad_size)
+        return super().forward(x, *args, **kwargs)
 
 # Workaround for increased memory usage in Conv3D with bfloat16 in torch 2.9.0 stable and up
 try:
@@ -55,10 +79,12 @@ class CausalConv3d(nn.Conv3d):
             self.weight.data = self.weight.data.float()
             if self.bias is not None:
                 self.bias.data = self.bias.data.float()
+            x = conv3d_p2pop(x, self._padding[2])
             
             result = super().forward(x.float())
                 
             return result.to(x.dtype)
+        x = conv3d_p2pop(x, self._padding[2])
 
         return super().forward(x)
 
@@ -103,11 +129,11 @@ class Resample(nn.Module):
         if mode == 'upsample2d':
             self.resample = nn.Sequential(
                 Upsample(scale_factor=(2., 2.), mode='nearest-exact'),
-                nn.Conv2d(dim, dim // 2, 3, padding=1))
+                DistConv2d(dim, dim // 2, 3, 1, padding=(0, 1)))
         elif mode == 'upsample3d':
             self.resample = nn.Sequential(
                 Upsample(scale_factor=(2., 2.), mode='nearest-exact'),
-                nn.Conv2d(dim, dim // 2, 3, padding=1))
+                DistConv2d(dim, dim // 2, 3, 1, padding=(0, 1)))
             self.time_conv = CausalConv3d(dim,
                                           dim * 2, (3, 1, 1),
                                           padding=(1, 0, 0))
@@ -115,11 +141,11 @@ class Resample(nn.Module):
         elif mode == 'downsample2d':
             self.resample = nn.Sequential(
                 nn.ZeroPad2d((0, 1, 0, 1)),
-                nn.Conv2d(dim, dim, 3, stride=(2, 2)))
+                DistDownConv2d(dim, dim, 3, 1, (0, 0), (2, 2)))
         elif mode == 'downsample3d':
             self.resample = nn.Sequential(
                 nn.ZeroPad2d((0, 1, 0, 1)),
-                nn.Conv2d(dim, dim, 3, stride=(2, 2)))
+                DistDownConv2d(dim, dim, 3, 1, (0, 0), (2, 2)))
             self.time_conv = CausalConv3d(dim,
                                           dim, (3, 1, 1),
                                           stride=(2, 1, 1),
