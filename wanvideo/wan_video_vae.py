@@ -1020,6 +1020,8 @@ class VideoVAE_(nn.Module):
 
     #modification originally by @raindrop313 https://github.com/raindrop313/ComfyUI-WanVideoStartEndFrames
     def encode_2(self, x, pbar=True, sample=False):
+        if args.world_size > 1:
+            x = tensor_chunk(x, -2)[args.rank]
         t = x.shape[2]
         iter_ = 2 + (t - 2) // 4
 
@@ -1047,6 +1049,8 @@ class VideoVAE_(nn.Module):
         out_tail = out[:, :, -1, :, :].unsqueeze(2)
         mu = torch.cat([self.conv1(out_head), self.conv1(out_tail)], dim=2).chunk(2, dim=1)[0]
         mu = (mu - self.mean.to(mu)) * self.inv_std.to(mu)
+        if args.world_size > 1:
+            mu = all_gather(None, mu, -2)
         if pbar:
             pbar.update_absolute(0)
 
@@ -1054,6 +1058,8 @@ class VideoVAE_(nn.Module):
 
 
     def encode(self, x, pbar=True, sample=False):
+        if args.world_size > 1:
+            x = tensor_chunk(x, -2)[args.rank]
         t = x.shape[2]
         iter_ = 1 + (t - 1) // 4
         if pbar:
@@ -1079,15 +1085,22 @@ class VideoVAE_(nn.Module):
             pbar.update_absolute(0)
 
         if sample:
+            if args.world_size > 1:
+                mu = all_gather(None, mu, -2)
+                log_var = all_gather(None, log_var, -2)
             std = torch.exp(0.5 * log_var.clamp(-30.0, 20.0))
             eps = torch.randn_like(std)
             return mu + std * eps
+        if args.world_size > 1:
+            mu = all_gather(None, mu, -2)
         return mu
 
 
     #modification originally by @raindrop313 https://github.com/raindrop313/ComfyUI-WanVideoStartEndFrames
     def decode_2(self, z):
         # z: [b,c,t,h,w]
+        if args.world_size > 1:
+            z = tensor_chunk(z, -2)[args.rank]
         
         z = z / self.inv_std.to(z) + self.mean.to(z)
       
@@ -1112,12 +1125,16 @@ class VideoVAE_(nn.Module):
                                     feat_idx=self._conv_idx)
                 out = torch.cat([out, out_], 2) # may add tensor offload
         self.clear_cache()
+        if args.world_size > 1:
+            out = all_gather(None, out, -2)
         return out
 
 
 
     def decode(self, z, pbar=True):
         # z: [b,c,t,h,w]
+        if args.world_size > 1:
+            z = tensor_chunk(z, -2)[args.rank]
         z = z / self.inv_std.to(z) + self.mean.to(z)
         iter_ = z.shape[2]
         if pbar:
@@ -1140,6 +1157,8 @@ class VideoVAE_(nn.Module):
         if pbar:
             pbar.update_absolute(0)
         self.clear_cache()
+        if args.world_size > 1:
+            out = all_gather(None, out, -2)
         return out
 
     def reparameterize(self, mu, log_var):
