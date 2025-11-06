@@ -922,7 +922,7 @@ class WanVideoImageToVideoEncode:
                 del resized_start_image, zero_frames
         else:
             temporal_mask = common_upscale(temporal_mask.unsqueeze(1), W, H, "nearest", "disabled").squeeze(1)
-            concatenated = resized_start_image[:,:num_frames].to(vae.dtype) * temporal_mask[:num_frames].unsqueeze(0).to(vae.dtype)
+            concatenated = resized_start_image[:,:num_frames].to(vae.dtype)# * temporal_mask[:num_frames].unsqueeze(0).to(vae.dtype)
             del resized_start_image, temporal_mask
 
         mm.soft_empty_cache()
@@ -1837,8 +1837,15 @@ class WanVideoScheduler: #WIP
                 # Annotate each sigma value
                 ax.scatter(x_values, sigmas_np, color='white', s=20, zorder=3)  # Small dots at each sigma
                 for x, y in zip(x_values, sigmas_np):
-                    if len(sigmas_np) <= 10:  # Only annotate if few steps
-                        ax.annotate(f"{y:.3f}", (x, y), textcoords="offset points", xytext=(10, 1), ha='center', color='orange', fontsize=12)
+                    # Show all annotations if few steps, or just show split step annotations
+                    show_annotation = len(sigmas_np) <= 10
+                    is_split_step = (start_idx > 0 and x == start_idx) or (end_idx != -1 and x == end_idx + 1)
+                    
+                    if show_annotation or is_split_step:
+                        color = 'orange'
+                        if is_split_step:
+                            color = 'yellow'
+                        ax.annotate(f"{y:.3f}", (x, y), textcoords="offset points", xytext=(10, 1), ha='center', color=color, fontsize=12)
                 ax.set_xticks(x_values)
                 ax.set_title("Sigmas", color='white')           # Title font color
                 ax.set_xlabel("Step", color='white')            # X label font color
@@ -1853,7 +1860,9 @@ class WanVideoScheduler: #WIP
                 if start_idx > 0 and 0 <= start_idx < len(sigmas_np):
                     ax.axvline(start_idx, color='green', linestyle='--', linewidth=2, label='start_step split')
                 if (end_idx != -1 and 0 <= end_idx < len(sigmas_np)) or (start_idx > 0 and 0 <= start_idx < len(sigmas_np)):
-                    ax.legend()
+                    handles, labels = ax.get_legend_handles_labels()
+                    if labels:
+                        ax.legend()
                 if start_idx < end_idx and 0 <= start_idx < len(sigmas_np) and 0 < end_idx < len(sigmas_np):
                     ax.axvspan(start_idx, end_idx, color='lightblue', alpha=0.1, label='Sampled Range')
                 plt.tight_layout()

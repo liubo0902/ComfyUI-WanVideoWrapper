@@ -128,7 +128,10 @@ def standardize_lora_key_format(lora_sd):
             k = k.replace('pipe.dit.', 'diffusion_model.')
         if k.startswith('blocks.'):
             k = k.replace('blocks.', 'diffusion_model.blocks.')
+        if k.startswith('vace_blocks.'):
+            k = k.replace('vace_blocks.', 'diffusion_model.vace_blocks.')
         k = k.replace('.default.', '.')
+        k = k.replace('.diff_m', '.modulation.diff')
 
         # Fun LoRA format
         if k.startswith('lora_unet__'):
@@ -275,7 +278,7 @@ class WanVideoBlockSwap:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "blocks_to_swap": ("INT", {"default": 20, "min": 0, "max": 40, "step": 1, "tooltip": "Number of transformer blocks to swap, the 14B model has 40, while the 1.3B model has 30 blocks"}),
+                "blocks_to_swap": ("INT", {"default": 20, "min": 0, "max": 48, "step": 1, "tooltip": "Number of transformer blocks to swap, the 14B model has 40, while the 1.3B and 5B models have 30 blocks. LongCat-video has 48"}),
                 "offload_img_emb": ("BOOLEAN", {"default": False, "tooltip": "Offload img_emb to offload_device"}),
                 "offload_txt_emb": ("BOOLEAN", {"default": False, "tooltip": "Offload time_emb to offload_device"}),
             },
@@ -326,7 +329,8 @@ class WanVideoTorchCompileSettings:
             },
             "optional": {
                 "dynamo_recompile_limit": ("INT", {"default": 128, "min": 0, "max": 1024, "step": 1, "tooltip": "torch._dynamo.config.recompile_limit"}),
-                "force_parameter_static_shapes": ("BOOLEAN", {"default": True, "tooltip": "torch._dynamo.config.force_parameter_static_shapes"}),
+                "force_parameter_static_shapes": ("BOOLEAN", {"default": False, "tooltip": "torch._dynamo.config.force_parameter_static_shapes"}),
+                "allow_unmerged_lora_compile": ("BOOLEAN", {"default": False, "tooltip": "Allow LoRA application to be compiled with torch.compile to avoid graph breaks, causes issues with some LoRAs, mostly dynamic ones"}),
             },
         }
     RETURN_TYPES = ("WANCOMPILEARGS",)
@@ -335,7 +339,8 @@ class WanVideoTorchCompileSettings:
     CATEGORY = "WanVideoWrapper"
     DESCRIPTION = "torch.compile settings, when connected to the model loader, torch.compile of the selected layers is attempted. Requires Triton and torch > 2.7.0 is recommended"
 
-    def set_args(self, backend, fullgraph, mode, dynamic, dynamo_cache_size_limit, compile_transformer_blocks_only, dynamo_recompile_limit=128, force_parameter_static_shapes=True):
+    def set_args(self, backend, fullgraph, mode, dynamic, dynamo_cache_size_limit, compile_transformer_blocks_only, dynamo_recompile_limit=128,
+                 force_parameter_static_shapes=True, allow_unmerged_lora_compile=False):
 
         compile_args = {
             "backend": backend,
@@ -346,6 +351,7 @@ class WanVideoTorchCompileSettings:
             "dynamo_recompile_limit": dynamo_recompile_limit,
             "compile_transformer_blocks_only": compile_transformer_blocks_only,
             "force_parameter_static_shapes": force_parameter_static_shapes,
+            "allow_unmerged_lora_compile": allow_unmerged_lora_compile,
         }
 
         return (compile_args, )
@@ -779,7 +785,7 @@ def rename_fuser_block(name):
     return new_name
 
 def load_weights(transformer, sd=None, weight_dtype=None, base_dtype=None, 
-                 transformer_load_device=None, block_swap_args=None, gguf=False, reader=None, patcher=None):
+                 transformer_load_device=None, block_swap_args=None, gguf=False, reader=None, patcher=None, compile_args=None):
     params_to_keep = {"time_in", "patch_embedding", "time_", "modulation", "text_embedding", 
                       "adapter", "add", "ref_conv", "casual_audio_encoder", "cond_encoder", "frame_packer", "audio_proj_glob", "face_encoder", "fuser_block"}
     param_count = sum(1 for _ in transformer.named_parameters())
@@ -834,7 +840,7 @@ def load_weights(transformer, sd=None, weight_dtype=None, base_dtype=None,
 
         if not getattr(transformer, "gguf_patched", False):
             transformer = _replace_with_gguf_linear(
-                transformer, base_dtype, sd, patches=patcher.patches
+                transformer, base_dtype, sd, patches=patcher.patches, compile_args=compile_args
             )
             transformer.gguf_patched = True
     else:
@@ -875,10 +881,12 @@ def load_weights(transformer, sd=None, weight_dtype=None, base_dtype=None,
             scale_key = key.replace(".weight", ".scale_weight")
             if scale_key in sd:
                 dtype_to_use = value.dtype
-            if "modulation" in name or "norm" in name or "bias" in name or "img_emb" in name:
+            if "bias" in name or "img_emb" in name:
                 dtype_to_use = base_dtype
             if "patch_embedding" in name or "motion_encoder" in name:
                 dtype_to_use = torch.float32
+            if "modulation" in name or "norm" in name:
+                dtype_to_use = value.dtype if value.dtype == torch.float32 else base_dtype
 
         load_device = transformer_load_device
         if block_swap_args is not None:
@@ -1000,6 +1008,7 @@ class WanVideoModelLoader:
                     "sageattn",
                     "sageattn_3",
                     "radial_sage_attention",
+                    "sageattn_compiled",
                     ], {"default": "sdpa"}),
                 "compile_args": ("WANCOMPILEARGS", ),
                 "block_swap_args": ("BLOCKSWAPARGS", ),
@@ -1087,20 +1096,34 @@ class WanVideoModelLoader:
                 if new_key != key:
                     sd[new_key] = sd.pop(key)
 
+        is_scaled_fp8 = False
+
         if quantization == "disabled":
             for k, v in sd.items():
                 if isinstance(v, torch.Tensor):
                     if v.dtype == torch.float8_e4m3fn:
                         quantization = "fp8_e4m3fn"
                         if "scaled_fp8" in sd:
+                            is_scaled_fp8 = True
                             quantization = "fp8_e4m3fn_scaled"
                         break
                     elif v.dtype == torch.float8_e5m2:
                         quantization = "fp8_e5m2"
                         if "scaled_fp8" in sd:
+                            is_scaled_fp8 = True
                             quantization = "fp8_e5m2_scaled"
                         break
-        
+
+        scale_weights = {}
+        if "fp8" in quantization:
+            for k, v in sd.items():
+                if k.endswith(".scale_weight"):
+                    is_scaled_fp8 = True
+                    break
+
+        if is_scaled_fp8 and "scaled" not in quantization:
+            quantization = quantization + "_scaled"
+
         if torch.cuda.is_available():
             #only warning for now
             major, minor = torch.cuda.get_device_capability(device)
@@ -1108,8 +1131,10 @@ class WanVideoModelLoader:
             if compile_args is not None and "e4" in quantization and (major, minor) < (8, 9):
                 log.warning("WARNING: Torch.compile with fp8_e4m3fn weights on CUDA compute capability < 8.9 may not be supported. Please use fp8_e5m2, GGUF or higher precision instead, or check the latest triton version that adds support for older architectures https://github.com/woct0rdho/triton-windows/releases/tag/v3.5.0-windows.post21")
 
-        if "scaled_fp8" in sd and "scaled" not in quantization:
+        if is_scaled_fp8 and "scaled" not in quantization:
             raise ValueError("The model is a scaled fp8 model, please set quantization to '_scaled'")
+        if not is_scaled_fp8 and "scaled" in quantization:
+            raise ValueError("The model is not a scaled fp8 model, please disable '_scaled' in quantization")
 
         if "vace_blocks.0.after_proj.weight" in sd and not "patch_embedding.weight" in sd:
             raise ValueError("You are attempting to load a VACE module as a WanVideo model, instead you should use the vace_model input and matching T2V base model")
@@ -1154,8 +1179,13 @@ class WanVideoModelLoader:
         in_features = sd["blocks.0.self_attn.k.weight"].shape[1]
         out_features = sd["blocks.0.self_attn.k.weight"].shape[0]
         log.info(f"Detected model in_channels: {in_channels}")
-        ffn_dim = sd["blocks.0.ffn.0.bias"].shape[0]
-        ffn2_dim = sd["blocks.0.ffn.2.weight"].shape[1]
+
+        if "blocks.0.ffn.0.bias" in sd:
+            ffn_dim = sd["blocks.0.ffn.0.bias"].shape[0]
+            ffn2_dim = sd["blocks.0.ffn.2.weight"].shape[1]
+        else:
+            ffn_dim = sd["blocks.0.ffn.w1.weight"].shape[0]
+            ffn2_dim = sd["blocks.0.ffn.w1.weight"].shape[1]
 
         patch_size=(1, 2, 2)
         if "patch_embedding.0.weight" in sd:
@@ -1202,6 +1232,9 @@ class WanVideoModelLoader:
             num_layers = 30
             out_dim = 48
             model_type = "t2v" #5B no img crossattn
+        elif dim == 4096: #longcat
+            num_heads = 32
+            num_layers = 48
         else: #1.3B
             num_heads = 12
             num_layers = 30
@@ -1315,6 +1348,7 @@ class WanVideoModelLoader:
             "rms_norm_function": rms_norm_function,
             "lynx_ip_layers": lynx_ip_layers,
             "lynx_ref_layers": lynx_ref_layers,
+            "is_longcat": dim == 4096,
 
         }
 
@@ -1463,9 +1497,9 @@ class WanVideoModelLoader:
                 if k.endswith(".scale_weight"):
                     scale_weights[k] = v.to(device, base_dtype)
 
-        if quantization == "fp8_e4m3fn":
+        if quantization in ["fp8_e4m3fn", "fp8_e4m3fn_fast"]:
             weight_dtype = torch.float8_e4m3fn
-        elif quantization == "fp8_e5m2":
+        elif quantization in ["fp8_e5m2", "fp8_e5m2_fast"]:
             weight_dtype = torch.float8_e5m2
         else:
             weight_dtype = base_dtype
@@ -1503,7 +1537,7 @@ class WanVideoModelLoader:
                 transformer.patched_linear = False
                 sd = None
             elif "scaled" in quantization or lora is not None:
-                transformer = _replace_linear(transformer, base_dtype, sd, scale_weights=scale_weights)
+                transformer = _replace_linear(transformer, base_dtype, sd, scale_weights=scale_weights, compile_args=compile_args)
                 transformer.patched_linear = True
 
         if "fast" in quantization:
@@ -1649,10 +1683,17 @@ class WanVideoVAELoader:
         if not has_model_prefix:
             vae_sd = {f"model.{k}": v for k, v in vae_sd.items()}
 
+        dim = vae_sd["model.decoder.conv1.bias"].shape[0]
+        if dim == 96:
+            log.info("Detected lightVAE model with 75% pruning")
+            pruning_rate = 0.75
+        else:
+            pruning_rate = 0.0
+
         if vae_sd["model.conv2.weight"].shape[0] == 16:
-            vae = WanVideoVAE(dtype=dtype)
+            vae = WanVideoVAE(dtype=dtype, pruning_rate=pruning_rate)
         elif vae_sd["model.conv2.weight"].shape[0] == 48:
-            vae = WanVideoVAE38(dtype=dtype)
+            vae = WanVideoVAE38(dtype=dtype, pruning_rate=pruning_rate)
 
         vae.load_state_dict(vae_sd)
         del vae_sd
