@@ -1,4 +1,4 @@
-import os, gc, math, copy
+import os, gc, math, copy, json
 import torch
 import numpy as np
 from tqdm import tqdm
@@ -23,6 +23,7 @@ from comfy import model_management as mm
 from comfy.utils import ProgressBar, load_torch_file
 from comfy.clip_vision import clip_preprocess, ClipVisionModel
 from comfy.cli_args import args, LatentPreviewMethod
+from dist_utils import args, tensor_chunk, all_gather, all_all, all_all_async, conv3d_p2pop, conv2d_p2pop, tensor_boradcast, tensor_chunk_send
 
 script_directory = os.path.dirname(os.path.abspath(__file__))
 
@@ -677,6 +678,14 @@ class WanVideoSampler:
         is_looped = False
         context_reference_latent = None
         if context_options is not None:
+            if args.world_size > 1 and args.only_sampler:
+                if args.rank == 0:
+                    json.dump(context_options, open("context_options.json", "w"))
+                torch.distributed.barrier()
+                context_options = json.load(open("context_options.json", "r"))
+                if args.rank == 0:
+                    os.system("rm context_options.json")
+                torch.distributed.barrier()
             context_schedule = context_options["context_schedule"]
             context_frames =  (context_options["context_frames"] - 1) // 4 + 1
             context_stride = context_options["context_stride"] // 4

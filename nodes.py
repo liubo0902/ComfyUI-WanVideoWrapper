@@ -13,6 +13,7 @@ from comfy import model_management as mm
 from comfy.utils import ProgressBar, common_upscale
 from comfy.clip_vision import clip_preprocess, ClipVisionModel
 import folder_paths
+from dist_utils import args, tensor_chunk, all_gather, all_all, all_all_async, conv3d_p2pop, conv2d_p2pop, tensor_boradcast, tensor_chunk_send
 
 script_directory = os.path.dirname(os.path.abspath(__file__))
 
@@ -1026,6 +1027,12 @@ class WanVideoAnimateEmbeds:
 
         num_refs = ref_images.shape[0] if ref_images is not None else 0
         num_frames = ((num_frames - 1) // 4) * 4 + 1
+        if args.world_size > 1 and args.only_sampler:
+            sync_tensors = torch.Tensor([num_frames, frame_window_size, num_refs]).to(torch.int32).to(args.rank)
+            sync_tensors = tensor_boradcast(sync_tensors.contiguous()).cpu()
+            num_frames = sync_tensors[0].item()
+            frame_window_size = sync_tensors[1].item()
+            num_refs = sync_tensors[2].item()
 
         looping = num_frames > frame_window_size
 
@@ -1072,6 +1079,13 @@ class WanVideoAnimateEmbeds:
             else:
                 resized_bg_images = bg_images.permute(3, 0, 1, 2) # C, T, H, W
             resized_bg_images = (resized_bg_images[:3] * 2 - 1)
+            if args.world_size > 1 and args.only_sampler:
+                data_device = resized_bg_images.device
+                datashape = torch.from_numpy(np.array(resized_bg_images.shape)).to(args.rank)
+                datashape = tensor_boradcast(datashape).tolist()
+                if args.rank != 0:
+                    resized_bg_images = resized_bg_images.new_empty(datashape)
+                resized_bg_images = tensor_boradcast(resized_bg_images.to(args.rank).contiguous()).to(data_device)
 
         if not looping:
             if bg_images is None:
@@ -1096,6 +1110,13 @@ class WanVideoAnimateEmbeds:
             if mask is None:
                 bg_mask = torch.zeros(1, num_frames, lat_h, lat_w, device=offload_device, dtype=vae.dtype)
             else:
+                if args.world_size > 1 and args.only_sampler:
+                    data_device = mask.device
+                    datashape = torch.from_numpy(np.array(mask.shape)).to(args.rank)
+                    datashape = tensor_boradcast(datashape).tolist()
+                    if args.rank != 0:
+                        mask = mask.new_empty(datashape)
+                    mask = tensor_boradcast(mask.to(args.rank).contiguous()).to(data_device)
                 bg_mask = 1 - mask[:num_frames]
                 if bg_mask.shape[0] < num_frames and not looping:
                     bg_mask = torch.cat([bg_mask, bg_mask[-1:].repeat(num_frames - bg_mask.shape[0], 1, 1)], dim=0)
@@ -1117,6 +1138,13 @@ class WanVideoAnimateEmbeds:
                 ref_latent = ref_latent_masked
 
         if face_images is not None:
+            if args.world_size > 1 and args.only_sampler:
+                data_device = face_images.device
+                datashape = torch.from_numpy(np.array(face_images.shape)).to(args.rank)
+                datashape = tensor_boradcast(datashape).tolist()
+                if args.rank != 0:
+                    face_images = face_images.new_empty(datashape)
+                face_images = tensor_boradcast(face_images.to(args.rank).contiguous()).to(data_device)
             face_images = face_images[..., :3]
             if face_images.shape[1] != 512 or face_images.shape[2] != 512:
                 resized_face_images = common_upscale(face_images.movedim(-1, 1), 512, 512, "lanczos", "center").movedim(0, 1)

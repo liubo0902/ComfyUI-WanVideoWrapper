@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 from comfy.utils import ProgressBar
 from dist_utils import args, tensor_chunk, all_gather, all_all, all_all_async, conv3d_p2pop, conv2d_p2pop, tensor_boradcast, tensor_chunk_send
+import numpy as np
 
 
 class DistConv2d(torch.nn.Conv2d):
@@ -1009,7 +1010,15 @@ class VideoVAE_(nn.Module):
     #modification originally by @raindrop313 https://github.com/raindrop313/ComfyUI-WanVideoStartEndFrames
     def encode_2(self, x, pbar=True, sample=False):
         if args.world_size > 1:
-            x = tensor_chunk(x, -2)[args.rank]
+            if args.only_sampler:
+                datashape = torch.from_numpy(np.array(x.shape)).to(args.rank)
+                datashape = tensor_boradcast(datashape).tolist()
+                if args.rank != 0:
+                    x = x.new_empty(datashape)
+                x = tensor_boradcast(x.contiguous())
+                x = tensor_chunk(x, -2)[args.rank].contiguous()
+            else:
+                x = tensor_chunk(x, -2)[args.rank].contiguous()
         t = x.shape[2]
         iter_ = 2 + (t - 2) // 4
 
@@ -1047,7 +1056,15 @@ class VideoVAE_(nn.Module):
 
     def encode(self, x, pbar=True, sample=False):
         if args.world_size > 1:
-            x = tensor_chunk(x, -2)[args.rank]
+            if args.only_sampler:
+                datashape = torch.from_numpy(np.array(x.shape)).to(args.rank)
+                datashape = tensor_boradcast(datashape).tolist()
+                if args.rank != 0:
+                    x = x.new_empty(datashape)
+                x = tensor_boradcast(x.contiguous())
+                x = tensor_chunk(x, -2)[args.rank]
+            else:
+                x = tensor_chunk(x, -2)[args.rank]
         t = x.shape[2]
         iter_ = 1 + (t - 1) // 4
         if pbar:
