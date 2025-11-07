@@ -2057,7 +2057,9 @@ class WanVideoDecode:
                 enable_vae_tiling = False
             images = vae.decode(latents, device=device, end_=(end_image is not None), tiled=enable_vae_tiling, tile_size=(tile_x//8, tile_y//8), tile_stride=(tile_stride_x//8, tile_stride_y//8))[0]
             
-        
+        if args.world_size > 1 and args.only_sampler:
+            if args.rank>0:
+                images = images[:, :100]
         images = images.cpu().float()
 
         if normalization == "minmax":

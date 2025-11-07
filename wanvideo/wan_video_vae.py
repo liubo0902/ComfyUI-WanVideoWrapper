@@ -1105,7 +1105,15 @@ class VideoVAE_(nn.Module):
     def decode_2(self, z):
         # z: [b,c,t,h,w]
         if args.world_size > 1:
-            z = tensor_chunk(z, -2)[args.rank]
+            if args.only_sampler:
+                datashape = torch.from_numpy(np.array(z.shape)).to(args.rank)
+                datashape = tensor_boradcast(datashape).tolist()
+                if args.rank != 0:
+                    z = z.new_empty(datashape)
+                z = tensor_boradcast(z.contiguous())
+                z = tensor_chunk(z, -2)[args.rank]
+            else:
+                z = tensor_chunk(z, -2)[args.rank]
         
         z = z / self.inv_std.to(z) + self.mean.to(z)
       
@@ -1139,7 +1147,15 @@ class VideoVAE_(nn.Module):
     def decode(self, z, pbar=True):
         # z: [b,c,t,h,w]
         if args.world_size > 1:
-            z = tensor_chunk(z, -2)[args.rank]
+            if args.only_sampler:
+                datashape = torch.from_numpy(np.array(z.shape)).to(args.rank)
+                datashape = tensor_boradcast(datashape).tolist()
+                if args.rank != 0:
+                    z = z.new_empty(datashape)
+                z = tensor_boradcast(z.contiguous())
+                z = tensor_chunk(z, -2)[args.rank]
+            else:
+                z = tensor_chunk(z, -2)[args.rank]
         z = z / self.inv_std.to(z) + self.mean.to(z)
         iter_ = z.shape[2]
         if pbar:
