@@ -1054,6 +1054,7 @@ class WanAttentionBlock(nn.Module):
         lynx_x_ip=None, lynx_ref_feature=None, lynx_ip_scale=1.0, lynx_ref_scale=1.0, #lynx
         x_ovi=None, e_ovi=None, freqs_ovi=None, context_ovi=None, seq_lens_ovi=None, grid_sizes_ovi=None,
         num_cond_latents=None, #longcat image cond amount
+        dist_seq_lens=[],
     ):
         r"""
         Args:
