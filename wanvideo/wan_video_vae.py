@@ -1063,11 +1063,15 @@ class VideoVAE_(nn.Module):
             if args.only_sampler:
                 datashape = torch.from_numpy(np.array(x.shape)).to(args.rank)
                 datashape = tensor_boradcast(datashape).tolist()
+                x_device = x.device
                 if args.rank != 0:
                     x = x.new_empty(datashape)
-                x = x.contiguous()
+                else:
+                    x = x.cpu()
+                    x = x.contiguous()
+                    torch.cuda.empty_cache()
+                    x = x.to(x_device)
                 x = tensor_boradcast(x)
-                x_device = x.device
                 x = x.cpu()
                 torch.cuda.empty_cache()
                 x = tensor_chunk(x, -2)[args.rank].contiguous().to(x_device)
