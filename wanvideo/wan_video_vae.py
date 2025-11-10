@@ -1015,8 +1015,12 @@ class VideoVAE_(nn.Module):
                 datashape = tensor_boradcast(datashape).tolist()
                 if args.rank != 0:
                     x = x.new_empty(datashape)
-                x = tensor_boradcast(x.contiguous())
-                x = tensor_chunk(x, -2)[args.rank].contiguous()
+                x = x.contiguous()
+                x = tensor_boradcast(x)
+                x_device = x.device
+                x = x.cpu()
+                torch.cuda.empty_cache()
+                x = tensor_chunk(x, -2)[args.rank].contiguous().to(x_device)
             else:
                 x = tensor_chunk(x, -2)[args.rank].contiguous()
         t = x.shape[2]
@@ -1061,8 +1065,12 @@ class VideoVAE_(nn.Module):
                 datashape = tensor_boradcast(datashape).tolist()
                 if args.rank != 0:
                     x = x.new_empty(datashape)
-                x = tensor_boradcast(x.contiguous())
-                x = tensor_chunk(x, -2)[args.rank]
+                x = x.contiguous()
+                x = tensor_boradcast(x)
+                x_device = x.device
+                x = x.cpu()
+                torch.cuda.empty_cache()
+                x = tensor_chunk(x, -2)[args.rank].contiguous().to(x_device)
             else:
                 x = tensor_chunk(x, -2)[args.rank]
         t = x.shape[2]

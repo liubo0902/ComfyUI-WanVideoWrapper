@@ -1085,7 +1085,9 @@ class WanVideoAnimateEmbeds:
                 datashape = tensor_boradcast(datashape).tolist()
                 if args.rank != 0:
                     resized_bg_images = resized_bg_images.new_empty(datashape)
-                resized_bg_images = tensor_boradcast(resized_bg_images.to(args.rank).contiguous()).to(data_device)
+                resized_bg_images = resized_bg_images.contiguous().to(args.rank)
+                resized_bg_images = tensor_boradcast(resized_bg_images).to(data_device)
+                torch.cuda.empty_cache()
 
         if not looping:
             if bg_images is None:
@@ -1116,7 +1118,9 @@ class WanVideoAnimateEmbeds:
                     datashape = tensor_boradcast(datashape).tolist()
                     if args.rank != 0:
                         mask = mask.new_empty(datashape)
-                    mask = tensor_boradcast(mask.to(args.rank).contiguous()).to(data_device)
+                    mask = mask.contiguous().to(args.rank)
+                    mask = tensor_boradcast(mask).to(data_device)
+                    torch.cuda.empty_cache()
                 bg_mask = 1 - mask[:num_frames]
                 if bg_mask.shape[0] < num_frames and not looping:
                     bg_mask = torch.cat([bg_mask, bg_mask[-1:].repeat(num_frames - bg_mask.shape[0], 1, 1)], dim=0)
@@ -1144,7 +1148,9 @@ class WanVideoAnimateEmbeds:
                 datashape = tensor_boradcast(datashape).tolist()
                 if args.rank != 0:
                     face_images = face_images.new_empty(datashape)
-                face_images = tensor_boradcast(face_images.to(args.rank).contiguous()).to(data_device)
+                face_images = face_images.contiguous().to(args.rank)
+                face_images = tensor_boradcast(face_images).to(data_device)
+                torch.cuda.empty_cache()
             face_images = face_images[..., :3]
             if face_images.shape[1] != 512 or face_images.shape[2] != 512:
                 resized_face_images = common_upscale(face_images.movedim(-1, 1), 512, 512, "lanczos", "center").movedim(0, 1)
