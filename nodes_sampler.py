@@ -1877,6 +1877,35 @@ class WanVideoSampler:
                         context_pbar = ProgressBar(steps)
                         step_start_progress = idx
 
+                        def data_broadcast(audio_proj, ctx, dim=1):
+                            if args.world_size > 1 and args.only_sampler:
+                                torch.distributed.barrier()
+                                if args.rank==0:
+                                    if dim==1:
+                                        partial_audio_proj = audio_proj[:, ctx]
+                                    elif dim==2:
+                                        partial_audio_proj = audio_proj[:, :, ctx]
+                                    np.save("partial_img_emb.npy", np.array(partial_audio_proj.shape))
+                                    datashape = torch.from_numpy(np.array(partial_audio_proj.shape)).to(args.rank)
+                                torch.distributed.barrier()
+                                if args.rank != 0:
+                                    datashape = torch.from_numpy(np.load("partial_img_emb.npy")).to(args.rank)
+                                torch.distributed.barrier()
+                                if args.rank==0:
+                                    os.system("rm -rf partial_img_emb.npy")
+                                datashape = tensor_boradcast(datashape).tolist()
+                                if args.rank != 0:
+                                    partial_audio_proj = audio_proj.new_empty(datashape)
+                                partial_audio_proj = partial_audio_proj.contiguous()
+                                data_device = partial_audio_proj.device
+                                partial_audio_proj = tensor_boradcast(partial_audio_proj.to(args.rank)).to(data_device)
+                            else:
+                                if dim==1:
+                                    partial_audio_proj = audio_proj[:, ctx]
+                                elif dim==2:
+                                    partial_audio_proj = audio_proj[:, :, ctx]
+                            return partial_audio_proj
+
                         # Validate all context windows before processing
                         max_idx = latent_model_input.shape[1] if latent_model_input.ndim > 1 else 0
                         for window_indices in context_queue:
@@ -1904,7 +1933,26 @@ class WanVideoSampler:
                             partial_img_emb = None
                             partial_control_latents = None
                             if image_cond is not None:
-                                partial_img_emb = image_cond[:, c]
+                                if args.world_size > 1 and args.only_sampler:
+                                    torch.distributed.barrier()
+                                    if args.rank==0:
+                                        partial_img_emb = image_cond[:, c]
+                                        np.save("partial_img_emb.npy", np.array(partial_img_emb.shape))
+                                        datashape = torch.from_numpy(np.array(partial_img_emb.shape)).to(args.rank)
+                                    torch.distributed.barrier()
+                                    if args.rank != 0:
+                                        datashape = torch.from_numpy(np.load("partial_img_emb.npy")).to(args.rank)
+                                    torch.distributed.barrier()
+                                    if args.rank==0:
+                                        os.system("rm -rf partial_img_emb.npy")
+                                    datashape = tensor_boradcast(datashape).tolist()
+                                    if args.rank != 0:
+                                        partial_img_emb = image_cond.new_empty(datashape)
+                                    partial_img_emb = partial_img_emb.contiguous()
+                                    data_device = partial_img_emb.device
+                                    partial_img_emb = tensor_boradcast(partial_img_emb.to(args.rank)).to(data_device)
+                                else:
+                                    partial_img_emb = image_cond[:, c]
                                 if c[0] != 0 and context_reference_latent is not None:
                                     if context_reference_latent.shape[0] == 1: #only single extra init latent
                                         new_init_image = context_reference_latent[0, :, 0].to(intermediate_device)
@@ -1927,13 +1975,51 @@ class WanVideoSampler:
 
                             partial_control_camera_latents = None
                             if control_camera_latents is not None:
-                                partial_control_camera_latents = control_camera_latents[:, :, c]
+                                if args.world_size > 1 and args.only_sampler:
+                                    torch.distributed.barrier()
+                                    if args.rank==0:
+                                        partial_control_camera_latents = control_camera_latents[:, :, c]
+                                        np.save("partial_img_emb.npy", np.array(partial_control_camera_latents.shape))
+                                        datashape = torch.from_numpy(np.array(partial_control_camera_latents.shape)).to(args.rank)
+                                    torch.distributed.barrier()
+                                    if args.rank != 0:
+                                        datashape = torch.from_numpy(np.load("partial_img_emb.npy")).to(args.rank)
+                                    torch.distributed.barrier()
+                                    if args.rank==0:
+                                        os.system("rm -rf partial_img_emb.npy")
+                                    datashape = tensor_boradcast(datashape).tolist()
+                                    if args.rank != 0:
+                                        partial_control_camera_latents = control_camera_latents.new_empty(datashape)
+                                    partial_control_camera_latents = partial_control_camera_latents.contiguous()
+                                    data_device = partial_control_camera_latents.device
+                                    partial_control_camera_latents = tensor_boradcast(partial_control_camera_latents.to(args.rank)).to(data_device)
+                                else:
+                                    partial_control_camera_latents = control_camera_latents[:, :, c]
 
                             partial_vace_context = None
                             if vace_data is not None:
                                 window_vace_data = []
                                 for vace_entry in vace_data:
-                                    partial_context = vace_entry["context"][0][:, c]
+                                    if args.world_size > 1 and args.only_sampler:
+                                        torch.distributed.barrier()
+                                        if args.rank==0:
+                                            partial_context = vace_entry["context"][0][:, c]
+                                            np.save("partial_img_emb.npy", np.array(partial_context.shape))
+                                            datashape = torch.from_numpy(np.array(partial_context.shape)).to(args.rank)
+                                        torch.distributed.barrier()
+                                        if args.rank != 0:
+                                            datashape = torch.from_numpy(np.load("partial_img_emb.npy")).to(args.rank)
+                                        torch.distributed.barrier()
+                                        if args.rank==0:
+                                            os.system("rm -rf partial_img_emb.npy")
+                                        datashape = tensor_boradcast(datashape).tolist()
+                                        if args.rank != 0:
+                                            partial_context = vace_entry["context"][0].new_empty(datashape)
+                                        partial_context = partial_context.contiguous()
+                                        data_device = partial_context.device
+                                        partial_context = tensor_boradcast(partial_context.to(args.rank)).to(data_device)
+                                    else:
+                                        partial_context = vace_entry["context"][0][:, c]
                                     if has_ref:
                                         if c[0] != 0 and context_reference_latent is not None:
                                             if context_reference_latent.shape[0] == 1: #only single extra init latent
@@ -1960,20 +2046,42 @@ class WanVideoSampler:
 
                             partial_audio_proj = None
                             if fantasytalking_embeds is not None:
-                                partial_audio_proj = audio_proj[:, c]
+                                if args.world_size > 1 and args.only_sampler:
+                                    torch.distributed.barrier()
+                                    if args.rank==0:
+                                        partial_audio_proj = audio_proj[:, c]
+                                        np.save("partial_img_emb.npy", np.array(partial_audio_proj.shape))
+                                        datashape = torch.from_numpy(np.array(partial_audio_proj.shape)).to(args.rank)
+                                    torch.distributed.barrier()
+                                    if args.rank != 0:
+                                        datashape = torch.from_numpy(np.load("partial_img_emb.npy")).to(args.rank)
+                                    torch.distributed.barrier()
+                                    if args.rank==0:
+                                        os.system("rm -rf partial_img_emb.npy")
+                                    datashape = tensor_boradcast(datashape).tolist()
+                                    if args.rank != 0:
+                                        partial_audio_proj = audio_proj.new_empty(datashape)
+                                    partial_audio_proj = partial_audio_proj.contiguous()
+                                    data_device = partial_audio_proj.device
+                                    partial_audio_proj = tensor_boradcast(partial_audio_proj.to(args.rank)).to(data_device)
+                                else:
+                                    partial_audio_proj = audio_proj[:, c]
 
                             partial_fantasy_portrait_input = None
                             if fantasy_portrait_input is not None:
                                 partial_fantasy_portrait_input = fantasy_portrait_input.copy()
-                                partial_fantasy_portrait_input["adapter_proj"] = fantasy_portrait_input["adapter_proj"][:, c]
+                                partial_fantasy_portrait_input["adapter_proj"] = data_broadcast(fantasy_portrait_input["adapter_proj"], c)
+                                # partial_fantasy_portrait_input["adapter_proj"] = fantasy_portrait_input["adapter_proj"][:, c]
 
-                            partial_latent_model_input = latent_model_input[:, c]
+                            partial_latent_model_input = data_broadcast(latent_model_input, c)
+                            # partial_latent_model_input = latent_model_input[:, c]
                             if latents_to_insert is not None and c[0] != 0:
                                 partial_latent_model_input[:, :1] = latents_to_insert
 
                             partial_unianim_data = None
                             if unianim_data is not None:
-                                partial_dwpose = dwpose_data[:, :, c]
+                                partial_dwpose = data_broadcast(dwpose_data, c, 2)
+                                # partial_dwpose = dwpose_data[:, :, c]
                                 partial_unianim_data = {
                                     "dwpose": partial_dwpose,
                                     "random_ref": unianim_data["random_ref"],
@@ -2005,7 +2113,26 @@ class WanVideoSampler:
 
                             partial_add_cond = None
                             if add_cond is not None:
-                                partial_add_cond = add_cond[:, :, c].to(device, dtype)
+                                if args.world_size > 1 and args.only_sampler:
+                                    torch.distributed.barrier()
+                                    if args.rank==0:
+                                        partial_add_cond = add_cond[:, :, c].to(device, dtype)
+                                        np.save("partial_img_emb.npy", np.array(partial_add_cond.shape))
+                                        datashape = torch.from_numpy(np.array(partial_add_cond.shape)).to(args.rank)
+                                    torch.distributed.barrier()
+                                    if args.rank != 0:
+                                        datashape = torch.from_numpy(np.load("partial_img_emb.npy")).to(args.rank)
+                                    torch.distributed.barrier()
+                                    if args.rank==0:
+                                        os.system("rm -rf partial_img_emb.npy")
+                                    datashape = tensor_boradcast(datashape).tolist()
+                                    if args.rank != 0:
+                                        partial_add_cond = add_cond.new_empty(datashape).to(device, dtype)
+                                    partial_add_cond = partial_add_cond.contiguous()
+                                    data_device = partial_add_cond.device
+                                    partial_add_cond = tensor_boradcast(partial_add_cond.to(args.rank)).to(data_device)
+                                else:
+                                    partial_add_cond = add_cond[:, :, c].to(device, dtype)
 
                             partial_wananim_face_pixels = partial_wananim_pose_latents = None
                             if wananim_face_pixels is not None and partial_wananim_face_pixels is None:
@@ -2013,13 +2140,50 @@ class WanVideoSampler:
                                 end = c[-1] * 4
                                 center_indices = torch.arange(start, end, 1)
                                 center_indices = torch.clamp(center_indices, min=0, max=wananim_face_pixels.shape[2] - 1)
-                                partial_wananim_face_pixels = wananim_face_pixels[:, :, center_indices].to(device, dtype)
+                                if args.world_size > 1 and args.only_sampler:
+                                    torch.distributed.barrier()
+                                    if args.rank==0:
+                                        partial_wananim_face_pixels = wananim_face_pixels[:, :, center_indices].to(device, dtype)
+                                        np.save("partial_img_emb.npy", np.array(partial_wananim_face_pixels.shape))
+                                        datashape = torch.from_numpy(np.array(partial_wananim_face_pixels.shape)).to(args.rank)
+                                    torch.distributed.barrier()
+                                    if args.rank != 0:
+                                        datashape = torch.from_numpy(np.load("partial_img_emb.npy")).to(args.rank)
+                                    torch.distributed.barrier()
+                                    if args.rank==0:
+                                        os.system("rm -rf partial_img_emb.npy")
+                                    datashape = tensor_boradcast(datashape).tolist()
+                                    if args.rank != 0:
+                                        partial_wananim_face_pixels = wananim_face_pixels.new_empty(datashape).to(device, dtype)
+                                    partial_wananim_face_pixels = partial_wananim_face_pixels.contiguous()
+                                    data_device = partial_wananim_face_pixels.device
+                                    partial_wananim_face_pixels = tensor_boradcast(partial_wananim_face_pixels.to(args.rank)).to(data_device)
+                                else:
+                                    partial_wananim_face_pixels = wananim_face_pixels[:, :, center_indices].to(device, dtype)
                             if wananim_pose_latents is not None:
                                 start = c[0]
                                 end = c[-1]
                                 center_indices = torch.arange(start, end, 1)
                                 center_indices = torch.clamp(center_indices, min=0, max=wananim_pose_latents.shape[2] - 1)
-                                partial_wananim_pose_latents = wananim_pose_latents[:, :, center_indices][:, :, :context_frames-1].to(device, dtype)
+                                if args.world_size > 1 and args.only_sampler:
+                                    torch.distributed.barrier()
+                                    if args.rank==0:
+                                        partial_wananim_pose_latents = wananim_pose_latents[:, :, center_indices][:, :, :context_frames-1].to(device, dtype)
+                                        np.save("partial_img_emb.npy", np.array(partial_wananim_pose_latents.shape))
+                                        datashape = torch.from_numpy(np.array(partial_wananim_pose_latents.shape)).to(args.rank)
+                                    torch.distributed.barrier()
+                                    if args.rank != 0:
+                                        datashape = torch.from_numpy(np.load("partial_img_emb.npy")).to(args.rank)
+                                    torch.distributed.barrier()
+                                    if args.rank==0:
+                                        os.system("rm -rf partial_img_emb.npy")
+                                    datashape = tensor_boradcast(datashape).tolist()
+                                    if args.rank != 0:
+                                        partial_wananim_pose_latents = wananim_pose_latents.new_empty(datashape).to(device, dtype)
+                                    partial_wananim_pose_latents = partial_wananim_pose_latents.contiguous()
+                                    partial_wananim_pose_latents = tensor_boradcast(partial_wananim_pose_latents)
+                                else:
+                                    partial_wananim_pose_latents = wananim_pose_latents[:, :, center_indices][:, :, :context_frames-1].to(device, dtype)
 
                             partial_flashvsr_LQ_latent = None
                             if LQ_images is not None:

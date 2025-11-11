@@ -1052,6 +1052,8 @@ class VideoVAE_(nn.Module):
         mu = (mu - self.mean.to(mu)) * self.inv_std.to(mu)
         if args.world_size > 1:
             mu = all_gather(None, mu, -2)
+            if args.only_sampler and args.rank>0:
+                mu = mu[:, :, :26]
         if pbar:
             pbar.update_absolute(0)
 
@@ -1105,11 +1107,16 @@ class VideoVAE_(nn.Module):
             if args.world_size > 1:
                 mu = all_gather(None, mu, -2)
                 log_var = all_gather(None, log_var, -2)
+                if args.only_sampler and args.rank>0:
+                    mu = mu[:, :, :26]
+                    log_var = log_var[:, :, :26]
             std = torch.exp(0.5 * log_var.clamp(-30.0, 20.0))
             eps = torch.randn_like(std)
             return mu + std * eps
         if args.world_size > 1:
             mu = all_gather(None, mu, -2)
+            if args.only_sampler and args.rank>0:
+                mu = mu[:, :, :26]
         return mu
 
 
@@ -1152,6 +1159,8 @@ class VideoVAE_(nn.Module):
         self.clear_cache()
         if args.world_size > 1:
             out = all_gather(None, out, -2)
+            if args.only_sampler and args.rank>0:
+                out = out[:, :, :100]
         return out
 
 
@@ -1192,6 +1201,8 @@ class VideoVAE_(nn.Module):
         self.clear_cache()
         if args.world_size > 1:
             out = all_gather(None, out, -2)
+            if args.only_sampler and args.rank>0:
+                out = out[:, :, :100]
         return out
 
     def reparameterize(self, mu, log_var):
