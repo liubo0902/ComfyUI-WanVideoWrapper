@@ -1060,7 +1060,9 @@ class WanVideoAnimateEmbeds:
                 resized_pose_images = pose_images.permute(3, 0, 1, 2) # C, T, H, W
             resized_pose_images = resized_pose_images * 2 - 1
             if not looping:
-                pose_latents = vae.encode([resized_pose_images.to(device, vae.dtype)], device,tiled=tiled_vae)
+                resized_pose_images = resized_pose_images.to(vae.dtype)
+                pose_latents = vae.encode([resized_pose_images], device,tiled=tiled_vae)
+                # pose_latents = vae.encode([resized_pose_images.to(device, vae.dtype)], device,tiled=tiled_vae)
                 pose_latents = pose_latents.to(offload_device)
             
                 if pose_latents.shape[2] < latent_window_size:
@@ -1092,7 +1094,9 @@ class WanVideoAnimateEmbeds:
         if not looping:
             if bg_images is None:
                 resized_bg_images = torch.zeros(3, num_frames - num_refs, H, W, device=device, dtype=vae.dtype)
-            bg_latents = vae.encode([resized_bg_images.to(device, vae.dtype)], device,tiled=tiled_vae)[0].to(offload_device)
+            # bg_latents = vae.encode([resized_bg_images.to(device, vae.dtype)], device,tiled=tiled_vae)[0].to(offload_device)
+            resized_bg_images = resized_bg_images.to(vae.dtype)
+            bg_latents = vae.encode([resized_bg_images], device,tiled=tiled_vae)[0].to(offload_device)
             del resized_bg_images
         elif bg_images is not None:
             resized_bg_images = resized_bg_images.to(offload_device, dtype=vae.dtype)
@@ -1104,7 +1108,9 @@ class WanVideoAnimateEmbeds:
                 resized_ref_images = ref_images.permute(3, 0, 1, 2) # C, T, H, W
             resized_ref_images = resized_ref_images[:3] * 2 - 1
 
-            ref_latent = vae.encode([resized_ref_images.to(device, vae.dtype)], device,tiled=tiled_vae)[0]
+            # ref_latent = vae.encode([resized_ref_images.to(device, vae.dtype)], device,tiled=tiled_vae)[0]
+            resized_ref_images = resized_ref_images.to(vae.dtype)
+            ref_latent = vae.encode([resized_ref_images], device,tiled=tiled_vae)[0]
             msk = torch.zeros(4, 1, lat_h, lat_w, device=device, dtype=vae.dtype)
             msk[:, :num_refs] = 1
             ref_latent_masked = torch.cat([msk, ref_latent], dim=0).to(offload_device) # 4+C 1 H W

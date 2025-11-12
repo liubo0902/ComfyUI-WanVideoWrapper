@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
 from comfy.utils import ProgressBar
-from dist_utils import args, tensor_chunk, all_gather, all_all, all_all_async, conv3d_p2pop, conv2d_p2pop, tensor_boradcast, tensor_chunk_send
+from dist_utils import args, tensor_chunk, all_gather, all_all, all_all_async, conv3d_p2pop, conv2d_p2pop, tensor_boradcast, tensor_chunk_send, tensor_chunk_send_cpu
 import numpy as np
 
 
@@ -1015,12 +1015,9 @@ class VideoVAE_(nn.Module):
                 datashape = tensor_boradcast(datashape).tolist()
                 if args.rank != 0:
                     x = x.new_empty(datashape)
-                x = x.contiguous()
-                x = tensor_boradcast(x)
-                x_device = x.device
-                x = x.cpu()
+                x = tensor_chunk_send_cpu(x, -2)
                 torch.cuda.empty_cache()
-                x = tensor_chunk(x, -2)[args.rank].contiguous().to(x_device)
+                torch.cuda.ipc_collect()
             else:
                 x = tensor_chunk(x, -2)[args.rank].contiguous()
         t = x.shape[2]
@@ -1065,18 +1062,11 @@ class VideoVAE_(nn.Module):
             if args.only_sampler:
                 datashape = torch.from_numpy(np.array(x.shape)).to(args.rank)
                 datashape = tensor_boradcast(datashape).tolist()
-                x_device = x.device
                 if args.rank != 0:
                     x = x.new_empty(datashape)
-                else:
-                    x = x.cpu()
-                    x = x.contiguous()
-                    torch.cuda.empty_cache()
-                    x = x.to(x_device)
-                x = tensor_boradcast(x)
-                x = x.cpu()
+                x = tensor_chunk_send_cpu(x, -2)
                 torch.cuda.empty_cache()
-                x = tensor_chunk(x, -2)[args.rank].contiguous().to(x_device)
+                torch.cuda.ipc_collect()
             else:
                 x = tensor_chunk(x, -2)[args.rank]
         t = x.shape[2]
@@ -1394,7 +1384,8 @@ class WanVideoVAE(nn.Module):
 
 
     def single_encode(self, video, device, pbar=True, sample=False):
-        video = video.to(device)
+        if not (args.world_size > 1 and args.only_sampler):
+            video = video.to(device)
         x = self.model.encode(video, pbar=pbar, sample=sample)
         return x.float()
 
@@ -1417,7 +1408,8 @@ class WanVideoVAE(nn.Module):
 
     def encode(self, videos, device, tiled=False,end_=False, tile_size=None, tile_stride=None, pbar=True, sample=False):
         self.model.clear_cache()
-        videos = [video.to("cpu") for video in videos]
+        if not (args.world_size > 1 and args.only_sampler):
+            videos = [video.to("cpu") for video in videos]
         hidden_states = []
         for video in videos:
             video = video.unsqueeze(0)
