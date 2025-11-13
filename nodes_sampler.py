@@ -683,6 +683,7 @@ class WanVideoSampler:
                     json.dump(context_options, open("context_options.json", "w"))
                 torch.distributed.barrier()
                 context_options = json.load(open("context_options.json", "r"))
+                torch.distributed.barrier()
                 if args.rank == 0:
                     os.system("rm context_options.json")
                 torch.distributed.barrier()
