@@ -121,11 +121,11 @@ class Resample(nn.Module):
         elif mode == 'downsample2d':
             self.resample = nn.Sequential(
                 nn.ZeroPad2d((0, 1, 0, 1)),
-                DistDownConv2d(dim, dim, 3, 1, (0, 0), (2, 2)))
+                nn.Conv2d(dim, dim, 3, stride=(2, 2)))
         elif mode == 'downsample3d':
             self.resample = nn.Sequential(
                 nn.ZeroPad2d((0, 1, 0, 1)),
-                DistDownConv2d(dim, dim, 3, 1, (0, 0), (2, 2)))
+                nn.Conv2d(dim, dim, 3, stride=(2, 2)))
             self.time_conv = CausalConv3d(dim,
                                           dim, (3, 1, 1),
                                           stride=(2, 1, 1),
@@ -173,7 +173,11 @@ class Resample(nn.Module):
                     x = x.reshape(b, c, t * 2, h, w)
         t = x.shape[2]
         x = rearrange(x, 'b c t h w -> (b t) c h w')
+        if 'down' in self.mode and args.world_size > 1:
+            x = all_gather(None, x.contiguous(), -2)
         x = self.resample(x)
+        if 'down' in self.mode and args.world_size > 1:
+            x = tensor_chunk_send(x, -2)[args.rank]
         x = rearrange(x, '(b t) c h w -> b c t h w', t=t)
 
         if self.mode == 'downsample3d':
@@ -337,6 +341,8 @@ class AttentionBlock(nn.Module):
 
     def forward(self, x):
         identity = x
+        if args.world_size>1:
+            x = all_gather(None, x, -2)
         b, c, t, h, w = x.size()
         x = rearrange(x, 'b c t h w -> (b t) c h w')
         x = self.norm(x)
@@ -351,6 +357,8 @@ class AttentionBlock(nn.Module):
         # output
         x = self.proj(x)
         x = rearrange(x, '(b t) c h w-> b c t h w', t=t)
+        if args.world_size>1:
+            x = tensor_chunk_send(x, -2)[args.rank]
         return x + identity
 
 
