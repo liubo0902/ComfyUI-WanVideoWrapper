@@ -2981,10 +2981,18 @@ class WanModel(torch.nn.Module):
                         lynx_ref_buffer[block_idx] = lynx_ref_feature
                 #uni3c controlnet
                 if uni3c_controlnet_states is not None and b < len(uni3c_controlnet_states):
+                    if args.world_size > 1:
+                        x = all_gather(None, x, dim=1)
                     x[:, :self.original_seq_len] += uni3c_controlnet_states[b].to(x) * uni3c_data["controlnet_weight"]
+                    if args.world_size > 1:
+                        x = tensor_chunk(x, dim=1)[args.rank]
                 #controlnet
                 if (controlnet is not None) and (b % controlnet["controlnet_stride"] == 0) and (b // controlnet["controlnet_stride"] < len(controlnet["controlnet_states"])):
+                    if args.world_size > 1:
+                        x = all_gather(None, x, dim=1)
                     x[:, :self.original_seq_len] += controlnet["controlnet_states"][b // controlnet["controlnet_stride"]].to(x) * controlnet["controlnet_weight"]
+                    if args.world_size > 1:
+                        x = tensor_chunk(x, dim=1)[args.rank]
 
             if args.world_size > 1:
                 x = all_gather(None, x, dim=1)

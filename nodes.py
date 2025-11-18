@@ -1137,6 +1137,7 @@ class WanVideoAnimateEmbeds:
                 bg_mask[:, :num_refs] = 1
             bg_mask_mask_repeated = torch.repeat_interleave(bg_mask[:, 0:1], repeats=4, dim=1) # T, C, H, W
             bg_mask = torch.cat([bg_mask_mask_repeated, bg_mask[:, 1:]], dim=1)
+            bg_mask = bg_mask[:, :bg_mask.shape[1] // 4 * 4]
             bg_mask = bg_mask.view(1, bg_mask.shape[1] // 4, 4, lat_h, lat_w) # 1, T, C, H, W
             bg_mask = bg_mask.movedim(1, 2)[0]# C, T, H, W
 
