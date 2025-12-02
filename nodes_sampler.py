@@ -69,6 +69,7 @@ def offload_transformer(transformer):
                 setattr(module, attr_name, MetaParameter(param.data.dtype, quant_type))
             else:
                 pass
+        remove_lora_from_module(transformer)
     else:
         transformer.to(offload_device)
 
@@ -251,6 +252,7 @@ class WanVideoSampler:
         if isinstance(scheduler, dict):
             sample_scheduler = copy.deepcopy(scheduler["sample_scheduler"])
             timesteps = scheduler["timesteps"]
+            start_step = scheduler.get("start_step", start_step)
         elif scheduler != "multitalk":
             sample_scheduler, timesteps,_,_ = get_scheduler(scheduler, steps, start_step, end_step, shift, device, transformer.dim, flowedit_args, denoise_strength, sigmas=sigmas, log_timesteps=True)
             log.info(f"sigmas: {sample_scheduler.sigmas}")
@@ -343,7 +345,8 @@ class WanVideoSampler:
                 dtype=torch.float32,
                 generator=seed_g,
                 device=torch.device("cpu"))
-            seq_len = image_embeds["max_seq_len"]
+            
+            seq_len = math.ceil((noise.shape[2] * noise.shape[3]) / 4 * noise.shape[1])
 
             control_embeds = image_embeds.get("control_embeds", None)
             if control_embeds is not None:
@@ -412,7 +415,7 @@ class WanVideoSampler:
                     dtype=torch.float32,
                     device=torch.device("cpu"),
                     generator=seed_g)
-
+            
             seq_len = math.ceil((noise.shape[2] * noise.shape[3]) / 4 * noise.shape[1])
 
             recammaster = image_embeds.get("recammaster", None)
@@ -925,6 +928,9 @@ class WanVideoSampler:
             rope_function = "default" #echoshot does not support comfy rope function
             log.info(f"Number of shots in prompt: {shot_num}, Shot token lengths: {shot_len}")
 
+        # Bindweave
+        qwenvl_embeds_pos = image_embeds.get("qwenvl_embeds_pos", None)
+        qwenvl_embeds_neg = image_embeds.get("qwenvl_embeds_neg", None)
 
         mm.unload_all_models()
         mm.soft_empty_cache()
@@ -1157,6 +1163,35 @@ class WanVideoSampler:
             log.info(f"UniLumos background latent input shape: {background_latents.shape}")
             background_latents = background_latents.to(device, dtype)
 
+        #Time-to-move (TTM)
+        ttm_start_step = 0
+        ttm_reference_latents = image_embeds.get("ttm_reference_latents", None)
+        if ttm_reference_latents is not None:
+            motion_mask = image_embeds["ttm_mask"].to(device, dtype)
+            ttm_start_step = max(image_embeds["ttm_start_step"] - start_step, 0)
+            ttm_end_step = image_embeds["ttm_end_step"] - start_step
+
+            if ttm_start_step > steps:
+                raise ValueError("TTM start step is beyond the total number of steps")
+
+            if ttm_end_step > ttm_start_step:
+                log.info("Using Time-to-move (TTM)")
+                log.info(f"TTM reference latents shape: {ttm_reference_latents.shape}")
+                log.info(f"TTM motion mask shape: {motion_mask.shape}")
+                log.info(f"Applying TTM from step {ttm_start_step} to {ttm_end_step}")
+
+                latent = add_noise(ttm_reference_latents, noise, timesteps[ttm_start_step].to(noise.device)).to(latent)
+
+        # SteadyDancer
+        sdancer_embeds = image_embeds.get("sdancer_embeds", None)
+        sdancer_data = sdancer_input = None
+        if sdancer_embeds is not None:
+            log.info("Using SteadyDancer embeddings:")
+            for k, v in sdancer_embeds.items():
+                log.info(f"  {k}: {v.shape if isinstance(v, torch.Tensor) else v}")
+            sdancer_data = sdancer_embeds.copy()
+            sdancer_data = dict_to_device(sdancer_data, device, dtype)
+
         #region model pred
         def predict_with_cfg(z, cfg_scale, positive_embeds, negative_embeds, timestep, idx, image_cond=None, clip_fea=None,
                              control_latents=None, vace_data=None, unianim_data=None, audio_proj=None, control_camera_latents=None,
@@ -1334,6 +1369,13 @@ class WanVideoSampler:
                 else:
                     uni3c_data_input = uni3c_data
 
+                if context_window is not None and sdancer_data is not None and sdancer_data["cond_pos"].shape[1] != context_frames:
+                    sdancer_input = sdancer_data.copy()
+                    sdancer_input["cond_pos"] = sdancer_data["cond_pos"][:, context_window]
+                    sdancer_input["cond_neg"] = sdancer_data["cond_neg"][:, context_window] if sdancer_data.get("cond_neg", None) is not None else None
+                else:
+                    sdancer_input = sdancer_data
+
                 if s2v_pose is not None:
                     if not ((s2v_pose_start_percent <= current_step_percentage <= s2v_pose_end_percent) or \
                             (s2v_pose_end_percent > 0 and idx == 0 and current_step_percentage >= s2v_pose_start_percent)):
@@ -1366,6 +1408,16 @@ class WanVideoSampler:
                     c_noise = (torch.sin(timestep) / (torch.cos(timestep) + torch.sin(timestep))) * 1000
                     z = z * c_in
                     timestep = c_noise
+
+                if image_cond is not None:
+                    self.noise_front_pad_num = image_cond_input.shape[1] - z.shape[1]
+                    if self.noise_front_pad_num > 0:
+                        pad = torch.zeros((z.shape[0], self.noise_front_pad_num, z.shape[2], z.shape[3]), dtype=z.dtype, device=z.device)
+                        z = torch.concat([pad, z], dim=1)
+                        nonlocal seq_len
+                        seq_len = math.ceil((z.shape[2] * z.shape[3]) / 4 * z.shape[1])
+                else:
+                    self.noise_front_pad_num = 0
 
                 if background_latents is not None or foreground_latents is not None:
                     z = torch.cat([z, foreground_latents.to(z), background_latents.to(z)], dim=0)
@@ -1425,7 +1477,8 @@ class WanVideoSampler:
                     "ovi_negative_text_embeds": ovi_negative_text_embeds, # Audio latent model negative text embeds for Ovi
                     "flashvsr_LQ_latent": flashvsr_LQ_latent, # FlashVSR LQ latent for upsampling
                     "flashvsr_strength": flashvsr_strength, # FlashVSR strength
-                    "num_cond_latents": len(all_indices) if transformer.is_longcat else None # number of cond latents LongCat to separate attention
+                    "num_cond_latents": len(all_indices) if transformer.is_longcat else None,
+                    "sdancer_input": sdancer_input, # SteadyDancer input
                 }
 
                 batch_size = 1
@@ -1441,6 +1494,7 @@ class WanVideoSampler:
                         #conditional (positive) pass
                         if pos_latent is not None: # for humo
                             base_params['x'] = [torch.cat([z[:, :-humo_reference_count], pos_latent], dim=1)]
+                        base_params["add_text_emb"] = qwenvl_embeds_pos.to(device) if qwenvl_embeds_pos is not None else None # QwenVL embeddings for Bindweave
                         noise_pred_cond, noise_pred_ovi, cache_state_cond = transformer(
                             context=positive_embeds,
                             pred_id=cache_state[0] if cache_state else None,
@@ -1457,6 +1511,7 @@ class WanVideoSampler:
                         #unconditional (negative) pass
                         base_params['is_uncond'] = True
                         base_params['clip_fea'] = clip_fea_neg if clip_fea_neg is not None else clip_fea
+                        base_params["add_text_emb"] = qwenvl_embeds_neg.to(device) if qwenvl_embeds_neg is not None else None # QwenVL embeddings for Bindweave
                         if wananim_face_pixels is not None:
                             base_params['wananim_face_pixel_values'] = torch.zeros_like(wananim_face_pixels).to(device, torch.float32) - 1
                         if humo_audio_input_neg is not None:
@@ -1615,7 +1670,7 @@ class WanVideoSampler:
 
         if not multitalk_sampling and not framepack and not wananimate_loop:
             log.info(f"Input sequence length: {seq_len}")
-            log.info(f"Sampling {(latent_video_length-1) * 4 + 1} frames at {latent.shape[3]*vae_upscale_factor}x{latent.shape[2]*vae_upscale_factor} with {steps} steps")
+            log.info(f"Sampling {(latent_video_length-1) * 4 + 1} frames at {latent.shape[3]*vae_upscale_factor}x{latent.shape[2]*vae_upscale_factor} with {steps-ttm_start_step} steps")
 
         intermediate_device = device
 
@@ -1699,9 +1754,9 @@ class WanVideoSampler:
                 if pusa_noisy_steps == -1:
                     pusa_noisy_steps = len(timesteps)
             try:
-                pbar = ProgressBar(len(timesteps))
+                pbar = ProgressBar(len(timesteps) - ttm_start_step)
                 #region main loop start
-                for idx, t in enumerate(tqdm(timesteps, disable=multitalk_sampling or wananimate_loop)):
+                for idx, t in enumerate(tqdm(timesteps[ttm_start_step:], disable=multitalk_sampling or wananimate_loop)):
                     if flowedit_args is not None:
                         if idx < skip_steps:
                             continue
@@ -3149,6 +3204,9 @@ class WanVideoSampler:
                     if flowedit_args is None:
                         latent = latent.to(intermediate_device)
 
+                        if self.noise_front_pad_num > 0:
+                            noise_pred = noise_pred[:, self.noise_front_pad_num:]
+
                         if use_tsr:
                             noise_pred = temporal_score_rescaling(noise_pred, latent, timestep, tsr_k, tsr_sigma)
 
@@ -3213,6 +3271,14 @@ class WanVideoSampler:
                                 )
                                 mask = masks[idx].to(latent)
                                 latent = image_latent * mask + latent * (1-mask)
+                        
+                        # TTM
+                        if ttm_reference_latents is not None and (idx + ttm_start_step) < ttm_end_step:
+                            if idx + ttm_start_step + 1 < len(sample_scheduler.all_timesteps):
+                                noisy_latents = add_noise(ttm_reference_latents, noise, sample_scheduler.all_timesteps[idx + ttm_start_step + 1].to(noise.device)).to(latent)
+                                latent = latent * (1 - motion_mask) + noisy_latents * motion_mask
+                            else:
+                                latent = latent * (1 - motion_mask) + ttm_reference_latents.to(latent) * motion_mask
 
                         if freeinit_args is not None:
                             current_latent = latent.clone()

@@ -395,7 +395,7 @@ class WanVideoLoraSelect:
                 return (loras_list,)
 
         try:
-            lora_path = folder_paths.get_full_path("loras", lora)
+            lora_path = folder_paths.get_full_path_or_raise("loras", lora)
         except:
             lora_path = lora
 
@@ -532,7 +532,7 @@ class WanVideoLoraSelectMulti:
             if not lora_name or lora_name == "none" or s == 0.0:
                 continue
             loras_list.append({
-                "path": folder_paths.get_full_path("loras", lora_name),
+                "path": folder_paths.get_full_path_or_raise("loras", lora_name),
                 "strength": s,
                 "name": os.path.splitext(lora_name)[0],
                 "blocks": blocks.get("selected_blocks", {}),
@@ -560,7 +560,7 @@ class WanVideoVACEModelSelect:
     DESCRIPTION = "VACE model to use when not using model that has it included, loaded from 'ComfyUI/models/diffusion_models'"
 
     def getvacepath(self, vace_model):
-        vace_model = [{"path": folder_paths.get_full_path("diffusion_models", vace_model)}]
+        vace_model = [{"path": folder_paths.get_full_path_or_raise("diffusion_models", vace_model)}]
         return (vace_model,)
     
 class WanVideoExtraModelSelect:
@@ -582,7 +582,7 @@ class WanVideoExtraModelSelect:
     DESCRIPTION = "Extra model to load and add to the main model, ie. VACE or MTV Crafter 'ComfyUI/models/diffusion_models'"
 
     def getmodelpath(self, extra_model, prev_model=None):
-        extra_model = {"path": folder_paths.get_full_path("diffusion_models", extra_model)}
+        extra_model = {"path": folder_paths.get_full_path_or_raise("diffusion_models", extra_model)}
         if prev_model is not None and isinstance(prev_model, list):
             extra_model_list = prev_model + [extra_model]
         else:
@@ -872,6 +872,7 @@ def load_weights(transformer, sd=None, weight_dtype=None, base_dtype=None,
         
         key = name.replace("_orig_mod.", "")
         value=sd[key]
+        keep_fp32 = ["patch_embedding", "motion_encoder", "condition_embedding"]
 
         if gguf:
             dtype_to_use = torch.float32 if "patch_embedding" in name or "motion_encoder" in name else base_dtype
@@ -883,7 +884,7 @@ def load_weights(transformer, sd=None, weight_dtype=None, base_dtype=None,
                 dtype_to_use = value.dtype
             if "bias" in name or "img_emb" in name:
                 dtype_to_use = base_dtype
-            if "patch_embedding" in name or "motion_encoder" in name:
+            if any(k in name for k in keep_fp32):
                 dtype_to_use = torch.float32
             if "modulation" in name or "norm" in name:
                 dtype_to_use = value.dtype if value.dtype == torch.float32 else base_dtype
@@ -1486,12 +1487,33 @@ class WanVideoModelLoader:
             transformer.add_proj = zero_module(torch.nn.Linear(inner_dim, inner_dim))
             transformer.attn_conv_in = torch.nn.Conv3d(attn_cond_in_dim, inner_dim, kernel_size=transformer.patch_size, stride=transformer.patch_size)
         
+        # Bindweave text_projection
+        if "text_projection.0.weight" in sd:
+            log.info("Bindweave model detected, adding text_projection to the model")
+            text_dim = sd["text_projection.0.weight"].shape[0]
+            transformer.text_projection = nn.Sequential(nn.Linear(sd["text_projection.0.weight"].shape[1], text_dim), nn.GELU(approximate='tanh'), nn.Linear(text_dim, text_dim))
+
         latent_format=Wan22 if dim == 3072 else Wan21
         comfy_model = WanVideoModel(
             WanVideoModelConfig(base_dtype, latent_format=latent_format),
             model_type=comfy.model_base.ModelType.FLOW,
             device=device,
         )
+
+        # SteadyDancer
+        if "condition_embedding_align.cross_attn.in_proj_bias" in sd:
+            from .steadydancer.mobilenetv2_dcd import DYModule
+            from .steadydancer.small_archs import PoseRefNetNoBNV3, FactorConv3d
+            in_dim_c = 16
+            transformer.patch_embedding_fuse = nn.Conv3d(in_channels + in_dim_c + in_dim_c, dim, kernel_size=patch_size, stride=patch_size) # x, fused pose, aligned pose
+            transformer.patch_embedding_ref_c = nn.Conv3d(in_dim_c, dim, kernel_size=patch_size, stride=patch_size) # ref_c
+            transformer.condition_embedding_spatial = DYModule(inp=in_dim_c, oup=in_dim_c) # Spatial Structure Adaptive Extractor
+            transformer.condition_embedding_temporal = nn.Sequential( # Temporal Motion Coherence Module
+                FactorConv3d(in_channels=in_dim_c, out_channels=in_dim_c, kernel_size=(3, 3, 3), stride=1), nn.SiLU(),
+                FactorConv3d(in_channels=in_dim_c, out_channels=in_dim_c, kernel_size=(3, 3, 3), stride=1), nn.SiLU(),
+                FactorConv3d(in_channels=in_dim_c, out_channels=in_dim_c, kernel_size=(3, 3, 3), stride=1), nn.SiLU())
+            transformer.condition_embedding_align = PoseRefNetNoBNV3(in_channels_x=16, in_channels_c=16, hidden_dim=128, num_heads=8) # Frame-wise Attention Alignment Unit
+
 
         comfy_model.diffusion_model = transformer
         comfy_model.load_device = transformer_load_device
@@ -1672,6 +1694,7 @@ class WanVideoVAELoader:
                     {"default": "bf16"}
                 ),
                 "compile_args": ("WANCOMPILEARGS", ),
+                "use_cpu_cache": ("BOOLEAN", {"default": False, "tooltip": "Reduces VRAM usage, but slows the VAE down a lot"}),
             }
         }
 
@@ -1681,9 +1704,9 @@ class WanVideoVAELoader:
     CATEGORY = "WanVideoWrapper"
     DESCRIPTION = "Loads Wan VAE model from 'ComfyUI/models/vae'"
 
-    def loadmodel(self, model_name, precision, compile_args=None):
+    def loadmodel(self, model_name, precision, compile_args=None, use_cpu_cache=False):
         dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[precision]
-        model_path = folder_paths.get_full_path("vae", model_name)
+        model_path = folder_paths.get_full_path_or_raise("vae", model_name)
         vae_sd = load_torch_file(model_path, safe_load=True)
 
         has_model_prefix = any(k.startswith("model.") for k in vae_sd.keys())
@@ -1698,9 +1721,9 @@ class WanVideoVAELoader:
             pruning_rate = 0.0
 
         if vae_sd["model.conv2.weight"].shape[0] == 16:
-            vae = WanVideoVAE(dtype=dtype, pruning_rate=pruning_rate)
+            vae = WanVideoVAE(dtype=dtype, pruning_rate=pruning_rate, cpu_cache=use_cpu_cache)
         elif vae_sd["model.conv2.weight"].shape[0] == 48:
-            vae = WanVideoVAE38(dtype=dtype, pruning_rate=pruning_rate)
+            vae = WanVideoVAE38(dtype=dtype, pruning_rate=pruning_rate, cpu_cache=use_cpu_cache)
 
         vae.load_state_dict(vae_sd)
         del vae_sd
@@ -1734,7 +1757,7 @@ class WanVideoTinyVAELoader:
         from .taehv import TAEHV
 
         dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[precision]
-        model_path = folder_paths.get_full_path("vae_approx", model_name)
+        model_path = folder_paths.get_full_path_or_raise("vae_approx", model_name)
         vae_sd = load_torch_file(model_path, safe_load=True)
         
         vae = TAEHV(vae_sd, parallel=parallel, dtype=dtype)
@@ -1772,7 +1795,7 @@ class LoadWanVideoT5TextEncoder:
 
         dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[precision]
 
-        model_path = folder_paths.get_full_path("text_encoders", model_name)
+        model_path = folder_paths.get_full_path_or_raise("text_encoders", model_name)
         sd = load_torch_file(model_path, safe_load=True)
 
         if quantization == "disabled":
@@ -1882,10 +1905,10 @@ class LoadWanVideoClipTextEncoder:
 
         dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[precision]
 
-        model_path = folder_paths.get_full_path("clip_vision", model_name)
+        model_path = folder_paths.get_full_path_or_raise("clip_vision", model_name)
         # We also support legacy setups where the model is in the text_encoders folder
         if model_path is None:
-            model_path = folder_paths.get_full_path("text_encoders", model_name)
+            model_path = folder_paths.get_full_path_or_raise("text_encoders", model_name)
         sd = load_torch_file(model_path, safe_load=True)
         if "log_scale" not in sd:
             raise ValueError("Invalid CLIP model, this node expectes the 'open-clip-xlm-roberta-large-vit-huge-14' model")
