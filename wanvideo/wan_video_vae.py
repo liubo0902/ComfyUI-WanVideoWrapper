@@ -304,7 +304,7 @@ class ResidualBlock(nn.Module):
             CausalConv3d(out_dim, out_dim, 3, padding=1))
         self.shortcut = CausalConv3d(in_dim, out_dim, 1) \
             if in_dim != out_dim else nn.Identity()
-        
+
     def forward(self, x, feat_cache=None, feat_idx=[0]):
         if self.cpu_cache:
             return self._forward_cpu_cache(x, feat_cache, feat_idx)
@@ -330,7 +330,7 @@ class ResidualBlock(nn.Module):
             else:
                 x = layer(x)
         return x + h
-    
+
     def _forward_cpu_cache(self, x, feat_cache=None, feat_idx=[0]):
         h = self.shortcut(x)
         for layer in self.residual:
@@ -340,11 +340,11 @@ class ResidualBlock(nn.Module):
                 if cache_x.shape[2] < 2 and feat_cache[idx] is not None:
                     cached_frame = feat_cache[idx][:, :, -1, :, :].unsqueeze(2).to(cache_x.device)
                     cache_x = torch.cat([cached_frame, cache_x], dim=2)
-                
+
                 prev_cache = feat_cache[idx].to(x.device) if feat_cache[idx] is not None else None
 
                 x = layer(x, prev_cache)
-                
+
                 feat_cache[idx] = cache_x.to("cpu", non_blocking=True)
                 feat_idx[0] += 1
             else:
@@ -1181,8 +1181,9 @@ class VideoVAE_(nn.Module):
             else:
                 z = tensor_chunk(z, -2)[args.rank]
         
+
         z = z / self.inv_std.to(z) + self.mean.to(z)
-      
+
         iter_ = z.shape[2]
         z_head=z[:,:,:-1,:,:]
         z_tail=z[:,:,-1,:,:].unsqueeze(2)
@@ -1332,7 +1333,7 @@ class WanVideoVAE(nn.Module):
         return mask
 
 
-    def tiled_decode(self, hidden_states, device, tile_size, tile_stride, pbar=True):
+    def tiled_decode(self, hidden_states, device, tile_size, tile_stride, end_=False, pbar=True):
         _, _, T, H, W = hidden_states.shape
         size_h, size_w = tile_size
         stride_h, stride_w = tile_stride
@@ -1349,14 +1350,20 @@ class WanVideoVAE(nn.Module):
         data_device = "cpu"
         computation_device = device
 
-        out_T = T * 4 - 3
-        weight = torch.zeros((1, 1, out_T, H * self.upsampling_factor, W * self.upsampling_factor), dtype=hidden_states.dtype, device=data_device)
-        values = torch.zeros((1, 3, out_T, H * self.upsampling_factor, W * self.upsampling_factor), dtype=hidden_states.dtype, device=data_device)
+        weight, values = None, None
         if pbar:
             pbar = ProgressBar(len(tasks))
         for h, h_, w, w_ in tqdm(tasks, desc="VAE decoding"):
             hidden_states_batch = hidden_states[:, :, :, h:h_, w:w_].to(computation_device)
-            hidden_states_batch = self.model.decode(hidden_states_batch).to(data_device)
+            if end_:
+                hidden_states_batch = self.model.decode_2(hidden_states_batch).to(data_device)
+            else:
+                hidden_states_batch = self.model.decode(hidden_states_batch).to(data_device)
+
+            if weight is None:
+                weight = torch.zeros((1, 1, hidden_states_batch.shape[2], H * self.upsampling_factor, W * self.upsampling_factor), dtype=hidden_states.dtype, device=data_device)
+            if values is None:
+                values = torch.zeros((1, 3, hidden_states_batch.shape[2], H * self.upsampling_factor, W * self.upsampling_factor), dtype=hidden_states.dtype, device=data_device)
 
             mask = self.build_mask(
                 hidden_states_batch,
@@ -1389,7 +1396,7 @@ class WanVideoVAE(nn.Module):
 
     def tiled_encode(self, video, device, tile_size, tile_stride, end_=False, pbar=True):
         _, _, T, H, W = video.shape
-        
+
         if tile_size is None and tile_stride is None:
             size_h, size_w = H //2, W // 2
             stride_h, stride_w = size_h // 2, size_w // 2
@@ -1502,7 +1509,7 @@ class WanVideoVAE(nn.Module):
         for hidden_state in hidden_states:
             hidden_state = hidden_state.unsqueeze(0)
             if tiled:
-                video = self.tiled_decode(hidden_state, device, tile_size, tile_stride, pbar=pbar)
+                video = self.tiled_decode(hidden_state, device, tile_size, tile_stride, end_=end_, pbar=pbar)
             else:
                 if end_:
                     video = self.double_decode(hidden_state, device)
@@ -1595,7 +1602,7 @@ class VideoVAE38_(VideoVAE_):
         except:
             pass
         z = z / self.inv_std.to(z) + self.mean.to(z)
-       
+
         iter_ = z.shape[2]
         if pbar:
             pbar = ProgressBar(iter_)
