@@ -824,6 +824,8 @@ class WanHuMoCrossAttention(WanSelfAttention):
 
         # Handle video spatial structure
         hlen_wlen = grid_sizes[0][1] * grid_sizes[0][2]
+        if args.world_size > 1:
+            q = all_gather(None, q, 2)
         q = q.reshape(-1, hlen_wlen, n, d)
 
         # Handle audio temporal structure (16 tokens per frame)
@@ -832,6 +834,8 @@ class WanHuMoCrossAttention(WanSelfAttention):
 
         x_text = attention(q, k, v, attention_mode=self.attention_mode, heads=self.num_heads)
         x_text = x_text.view(b, -1, n, d).flatten(2)
+        if args.world_size > 1:
+            x_text = tensor_chunk(x_text, dim=1)[args.rank]
 
         x = x_text
 
@@ -1145,9 +1149,15 @@ class WanAttentionBlock(nn.Module):
         else:
             if "comfy" in self.rope_func:
                 num_chunks = 2 if self.rope_func == "comfy_chunked" else 1
+                if args.world_size > 1:
+                    freqs = tensor_chunk(freqs, dim=1)[args.rank]
                 q = self.self_attn.qkv_fn_q_with_rope(input_x, freqs, num_chunks=num_chunks, is_longcat=is_longcat)
                 k = self.self_attn.qkv_fn_k_with_rope(input_x, freqs, num_chunks=num_chunks, is_longcat=is_longcat)
                 v = self.self_attn.qkv_fn_v(input_x)
+                if args.world_size > 1:
+                    q = all_all(q, 2, 1)
+                    k = all_all(k, 2, 1)
+                    v = all_all(v, 2, 1)
             else:
                 q, k, v = self.self_attn.qkv_fn(input_x)
                 if args.world_size > 1:
