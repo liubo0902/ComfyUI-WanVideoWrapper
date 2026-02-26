@@ -1026,7 +1026,8 @@ class VideoVAE_(nn.Module):
                  mean=None,
                  inv_std=None,
                  pruning_rate=0.0,
-                 cpu_cache=False):
+                 cpu_cache=False,
+                 verbose=False):
         super().__init__()
         self.dim = dim
         self.z_dim = z_dim
@@ -1037,6 +1038,7 @@ class VideoVAE_(nn.Module):
         self.temperal_upsample = temperal_downsample[::-1]
         self.mean = mean
         self.inv_std = inv_std
+        self.verbose = verbose
 
         # modules
         self.encoder = Encoder3d(dim, z_dim * 2, dim_mult, num_res_blocks,
@@ -1158,12 +1160,13 @@ class VideoVAE_(nn.Module):
             mu = all_gather(None, mu, -2)
             if args.only_sampler and args.rank>0:
                 mu = mu[:, :, :26]
-        try:
-            log.info(f"WanVAE encoded input:{input_shape} to {out.shape}")
-            print_memory(device, process="WanVAE encode")
-            torch.cuda.reset_peak_memory_stats(device)
-        except:
-            pass
+        if self.verbose:
+            try:
+                log.info(f"WanVAE encoded input:{input_shape} to {out.shape}")
+                print_memory(device, process="WanVAE encode")
+                torch.cuda.reset_peak_memory_stats(device)
+            except:
+                pass
         return mu
 
 
@@ -1235,7 +1238,7 @@ class VideoVAE_(nn.Module):
         except:
             pass
         x = self.conv2(z)
-        for i in range(iter_):
+        for i in tqdm(range(iter_), desc="WanVAE decoding frames", disable=not pbar):
             self._conv_idx = [0]
             if i == 0:
                 out = self.decoder(x[:, :, i:i + 1, :, :],
@@ -1256,12 +1259,13 @@ class VideoVAE_(nn.Module):
             out = all_gather(None, out, -2)
             if args.only_sampler and args.rank>0:
                 out = out[:, :, :100]
-        try:
-            log.info(f"WanVAE decoded input:{input_shape} to {out.shape}")
-            print_memory(device, process="WanVAE decode")
-            torch.cuda.reset_peak_memory_stats(device)
-        except:
-            pass
+        if self.verbose:
+            try:
+                log.info(f"WanVAE decoded input:{input_shape} to {out.shape}")
+                print_memory(device, process="WanVAE decode")
+                torch.cuda.reset_peak_memory_stats(device)
+            except:
+                pass
         return out
 
     def reparameterize(self, mu, log_var):
@@ -1288,12 +1292,12 @@ class VideoVAE_(nn.Module):
 
 class WanVideoVAE(nn.Module):
 
-    def __init__(self, z_dim=16, dtype=torch.float32, pruning_rate=0.0, cpu_cache=False):
+    def __init__(self, z_dim=16, dtype=torch.float32, pruning_rate=0.0, cpu_cache=False, verbose=False):
         super().__init__()
 
         self.dtype = dtype
         self.cpu_cache = cpu_cache
-
+        self.verbose = verbose
         mean = [
             -0.7571, -0.7089, -0.9113, 0.1075, -0.1745, 0.9653, -0.1517, 1.5508,
             0.4134, -0.0715, 0.5517, -0.3632, -0.1922, -0.9497, 0.2503, -0.2921
@@ -1307,7 +1311,7 @@ class WanVideoVAE(nn.Module):
         self.z_dim = z_dim
 
         # init model
-        self.model = VideoVAE_(z_dim=z_dim, mean=self.mean, inv_std=self.inv_std, pruning_rate=pruning_rate, cpu_cache=self.cpu_cache).eval().requires_grad_(False)
+        self.model = VideoVAE_(z_dim=z_dim, mean=self.mean, inv_std=self.inv_std, pruning_rate=pruning_rate, cpu_cache=self.cpu_cache, verbose=self.verbose).eval().requires_grad_(False)
         self.upsampling_factor = 8
 
 
@@ -1535,7 +1539,8 @@ class VideoVAE38_(VideoVAE_):
                  mean=None,
                  inv_std=None,
                  pruning_rate=0.0,
-                 cpu_cache=False):
+                 cpu_cache=False,
+                 verbose=False):
         super(VideoVAE_, self).__init__()
         self.dim = dim
         self.z_dim = z_dim
@@ -1548,6 +1553,7 @@ class VideoVAE38_(VideoVAE_):
         self.mean = mean
         self.inv_std = inv_std
         self.cpu_cache = cpu_cache
+        self.verbose = verbose
 
         # modules
         self.encoder = Encoder3d_38(dim, z_dim * 2, dim_mult, num_res_blocks,
@@ -1585,12 +1591,13 @@ class VideoVAE38_(VideoVAE_):
         mu = self.conv1(out).chunk(2, dim=1)[0]
         mu = (mu - self.mean.to(mu)) * self.inv_std.to(mu)
         self.clear_cache()
-        try:
-            log.info(f"WanVAE decoded input:{input_shape} to {out.shape}")
-            print_memory(device, process="WanVAE decode")
-            torch.cuda.reset_peak_memory_stats(device)
-        except:
-            pass
+        if self.verbose:
+            try:
+                log.info(f"WanVAE decoded input:{input_shape} to {out.shape}")
+                print_memory(device, process="WanVAE decode")
+                torch.cuda.reset_peak_memory_stats(device)
+            except:
+                pass
         return mu
 
 
@@ -1623,18 +1630,19 @@ class VideoVAE38_(VideoVAE_):
                 pbar.update(1)
         out = unpatchify(out, patch_size=2)
         self.clear_cache()
-        try:
-            log.info(f"WanVAE decoded input:{input_shape} to {out.shape}")
-            print_memory(device, process="WanVAE decode")
-            torch.cuda.reset_peak_memory_stats(device)
-        except:
-            pass
+        if self.verbose:
+            try:
+                log.info(f"WanVAE decoded input:{input_shape} to {out.shape}")
+                print_memory(device, process="WanVAE decode")
+                torch.cuda.reset_peak_memory_stats(device)
+            except:
+                pass
         return out
 
 
 class WanVideoVAE38(WanVideoVAE):
 
-    def __init__(self, z_dim=48, dim=160, dtype=torch.bfloat16, pruning_rate=0.0, cpu_cache=False):
+    def __init__(self, z_dim=48, dim=160, dtype=torch.bfloat16, pruning_rate=0.0, cpu_cache=False, verbose=False):
         super(WanVideoVAE, self).__init__()
 
         mean = [
@@ -1658,7 +1666,8 @@ class WanVideoVAE38(WanVideoVAE):
         self.dtype = dtype
         self.z_dim = z_dim
         self.cpu_cache = cpu_cache
+        self.verbose = verbose
 
         # init model
-        self.model = VideoVAE38_(z_dim=z_dim, dim=dim, dtype=dtype, mean=self.mean, inv_std=self.inv_std, pruning_rate=pruning_rate, cpu_cache=cpu_cache).eval().requires_grad_(False)
+        self.model = VideoVAE38_(z_dim=z_dim, dim=dim, dtype=dtype, mean=self.mean, inv_std=self.inv_std, pruning_rate=pruning_rate, cpu_cache=cpu_cache, verbose=verbose).eval().requires_grad_(False)
         self.upsampling_factor = 16
