@@ -1124,7 +1124,7 @@ class VideoVAE_(nn.Module):
             pbar = ProgressBar(iter_)
         try:
             torch.cuda.reset_peak_memory_stats(device)
-        except:
+        except Exception:
             pass
 
         for i in tqdm(range(iter_), desc="WanVAE encoding frames", disable=not pbar):
@@ -1165,7 +1165,7 @@ class VideoVAE_(nn.Module):
                 log.info(f"WanVAE encoded input:{input_shape} to {out.shape}")
                 print_memory(device, process="WanVAE encode")
                 torch.cuda.reset_peak_memory_stats(device)
-            except:
+            except Exception:
                 pass
         return mu
 
@@ -1235,7 +1235,7 @@ class VideoVAE_(nn.Module):
             pbar = ProgressBar(iter_)
         try:
             torch.cuda.reset_peak_memory_stats(device)
-        except:
+        except Exception:
             pass
         x = self.conv2(z)
         for i in tqdm(range(iter_), desc="WanVAE decoding frames", disable=not pbar):
@@ -1264,7 +1264,7 @@ class VideoVAE_(nn.Module):
                 log.info(f"WanVAE decoded input:{input_shape} to {out.shape}")
                 print_memory(device, process="WanVAE decode")
                 torch.cuda.reset_peak_memory_stats(device)
-            except:
+            except Exception:
                 pass
         return out
 
@@ -1568,7 +1568,7 @@ class VideoVAE38_(VideoVAE_):
         self.clear_cache()
         try:
             torch.cuda.reset_peak_memory_stats(device)
-        except:
+        except Exception:
             pass
         x = patchify(x, patch_size=2)
         t = x.shape[2]
@@ -1596,7 +1596,7 @@ class VideoVAE38_(VideoVAE_):
                 log.info(f"WanVAE decoded input:{input_shape} to {out.shape}")
                 print_memory(device, process="WanVAE decode")
                 torch.cuda.reset_peak_memory_stats(device)
-            except:
+            except Exception:
                 pass
         return mu
 
@@ -1606,7 +1606,7 @@ class VideoVAE38_(VideoVAE_):
         input_shape = z.shape
         try:
             torch.cuda.reset_peak_memory_stats(device)
-        except:
+        except Exception:
             pass
         z = z / self.inv_std.to(z) + self.mean.to(z)
 
@@ -1635,7 +1635,7 @@ class VideoVAE38_(VideoVAE_):
                 log.info(f"WanVAE decoded input:{input_shape} to {out.shape}")
                 print_memory(device, process="WanVAE decode")
                 torch.cuda.reset_peak_memory_stats(device)
-            except:
+            except Exception:
                 pass
         return out
 
